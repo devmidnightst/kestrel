@@ -3,11 +3,13 @@ package compiler
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -20,17 +22,24 @@ func requireCC(t *testing.T) {
 
 func buildAndRun(t *testing.T, entry string) (string, string, int) {
 	t.Helper()
+	return buildAndRunOpts(t, entry, BuildOptions{})
+}
+
+func buildAndRunOpts(t *testing.T, entry string, opts BuildOptions, args ...string) (string, string, int) {
+	t.Helper()
 	exe := filepath.Join(t.TempDir(), "prog")
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	if err := Build(entry, BuildOptions{Output: exe}); err != nil {
+	opts.Output = exe
+	if err := Build(entry, opts); err != nil {
 		t.Fatalf("build %s: %v", entry, err)
 	}
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(exe)
+	cmd := exec.Command(exe, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	cmd.Env = append(os.Environ(), sanitizerEnv()...)
 	code := 0
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
@@ -40,6 +49,42 @@ func buildAndRun(t *testing.T, entry string) (string, string, int) {
 		code = exit.ExitCode()
 	}
 	return stdout.String(), stderr.String(), code
+}
+
+var (
+	sanitizerOnce sync.Once
+	sanitizerErr  error
+)
+
+func requireSanitizers(t *testing.T) {
+	t.Helper()
+	requireCC(t)
+	sanitizerOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "kestrel-san-")
+		if err != nil {
+			sanitizerErr = err
+			return
+		}
+		defer os.RemoveAll(dir)
+		src := filepath.Join(dir, "main.ks")
+		if err := os.WriteFile(src, []byte("fn main() { print(\"ok\"); }"), 0o644); err != nil {
+			sanitizerErr = err
+			return
+		}
+		exe := filepath.Join(dir, "prog")
+		if err := Build(src, BuildOptions{Output: exe, Sanitize: true}); err != nil {
+			sanitizerErr = err
+			return
+		}
+		cmd := exec.Command(exe)
+		cmd.Env = append(os.Environ(), sanitizerEnv()...)
+		if out, err := cmd.CombinedOutput(); err != nil || string(out) != "ok\n" {
+			sanitizerErr = fmt.Errorf("sanitized program failed: %v %q", err, out)
+		}
+	})
+	if sanitizerErr != nil {
+		t.Skipf("sanitizers unavailable: %v", sanitizerErr)
+	}
 }
 
 func runSource(t *testing.T, src string) (string, string, int) {
@@ -143,7 +188,7 @@ func TestEmitC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "int main(void)") {
+	if !strings.Contains(string(data), "int main(int argc, char **argv)") {
 		t.Errorf("emitted c does not contain main")
 	}
 }
@@ -157,6 +202,9 @@ func TestExamples(t *testing.T) {
 		"loops.ks":        "sum 1..100 = 5050\nfirst ten primes: 2 3 5 7 11 13 17 19 23 29 \nfib(10) = 55\n",
 		"modules/main.ks": "gcd(84, 36) = 12\npow(3, 4) = 81\n== modules ==\n",
 		"cheader.ks":      "llabs(-42) = 42\n",
+		"arrays.ks":       "original: [42, 7, 19, 3, 88, 1]\nsorted: [1, 3, 7, 19, 42, 88]\npopped c left [\"a\", \"b\"]\nidentity: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]\nmiddle: [3, 7, 19, 42]\n",
+		"structs.ks":      "Item { name: \"rope\", price: 4.5, qty: 10 }\ntoday: 57.25 yesterday: 25.75\nInventory { owner: \"kes\", items: [Item { name: \"rope\", price: 4.5, qty: 3 }, Item { name: \"lamp\", price: 12.25, qty: 1 }] }\n",
+		"wordfreq.ks":     "lines: 0\n",
 	}
 	for name, want := range examples {
 		t.Run(name, func(t *testing.T) {
@@ -211,4 +259,12 @@ func TestFailedBuildKeepsExistingOutput(t *testing.T) {
 	if err != nil || string(data) != "previous" {
 		t.Errorf("existing output was clobbered: %q, %v", data, err)
 	}
+}
+
+func sanitizerEnv() []string {
+	env := []string{"UBSAN_OPTIONS=print_stacktrace=1"}
+	if runtime.GOOS == "linux" {
+		env = append(env, "ASAN_OPTIONS=detect_leaks=1")
+	}
+	return env
 }

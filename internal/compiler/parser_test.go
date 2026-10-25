@@ -21,7 +21,27 @@ func exprString(e Expr) string {
 	case *BinaryExpr:
 		return fmt.Sprintf("(%s %s %s)", exprString(e.X), e.Op, exprString(e.Y))
 	case *SelectorExpr:
-		return e.X.Name + "." + e.Name
+		return exprString(e.X) + "." + e.Name
+	case *IndexExpr:
+		return exprString(e.X) + "[" + exprString(e.Index) + "]"
+	case *FloatLit:
+		return e.Text
+	case *ArrayLit:
+		elems := make([]string, len(e.Elems))
+		for i, el := range e.Elems {
+			elems[i] = exprString(el)
+		}
+		return "[" + strings.Join(elems, ", ") + "]"
+	case *StructLit:
+		fields := make([]string, len(e.Fields))
+		for i, fi := range e.Fields {
+			fields[i] = fi.Name + ": " + exprString(fi.Value)
+		}
+		name := e.Name
+		if e.Module != "" {
+			name = e.Module + "." + name
+		}
+		return name + " {" + strings.Join(fields, ", ") + "}"
 	case *CallExpr:
 		args := make([]string, len(e.Args))
 		for i, a := range e.Args {
@@ -132,7 +152,7 @@ fn main() {
 	if p := elif.Else.(*BlockStmt).Block.Stmts[0].(*PrintStmt); len(p.Args) != 2 {
 		t.Errorf("print args: %d", len(p.Args))
 	}
-	if a := loop.Body.Stmts[1].(*AssignStmt); a.Name != "i" {
+	if a := loop.Body.Stmts[1].(*AssignStmt); a.Target.(*Ident).Name != "i" {
 		t.Errorf("bad assignment %+v", a)
 	}
 	if _, ok := loop.Body.Stmts[2].(*BlockStmt); !ok {
@@ -155,11 +175,11 @@ func TestParseErrors(t *testing.T) {
 		{"fn main() {\n  let x = 1\n}", "p.ks:3:1: error: expected \";\" after variable declaration, found \"}\""},
 		{"fn main() {\n  var x;\n}", "p.ks:2:8: error: expected \"=\" in variable declaration (variables must be initialized)"},
 		{"fn main() {\n  1 + 2;\n}", "p.ks:2:3: error: expression result is unused"},
-		{"fn main() {\n  f() = 3;\n}", "p.ks:2:7: error: only a plain variable name can be assigned to"},
+		{"fn main() {\n  f() = 3;\n}", "p.ks:2:7: error: cannot assign to this expression"},
 		{"fn main() {\n  print(1;\n}", "p.ks:2:10: error: expected \")\" to close argument list"},
 		{"fn main() {\n  if x { }", "p.ks:2:11: error: unexpected end of file, expected \"}\" to close block opened at 1:11"},
-		{"let x = 1;", "p.ks:1:1: error: expected function declaration, found \"let\""},
-		{"fn main() {}\nimport \"a.ks\";", "p.ks:2:1: error: imports must appear before all function declarations"},
+		{"let x = 1;", "p.ks:1:1: error: expected function or struct declaration, found \"let\""},
+		{"fn main() {}\nimport \"a.ks\";", "p.ks:2:1: error: imports must appear before all declarations"},
 		{"fn f(a int) {}", "p.ks:1:8: error: expected \":\" after parameter name"},
 		{"fn main() { let v = (1 + 2)(3); }", "p.ks:1:28: error: only named functions can be called"},
 		{"import lib;", "p.ks:1:8: error: expected module path string after import, found identifier \"lib\""},
@@ -209,5 +229,60 @@ func TestSourceSizeLimit(t *testing.T) {
 	_, err := Lex("big.ks", make([]byte, MaxSourceSize+1))
 	if err == nil || !strings.Contains(err.Error(), "larger than") {
 		t.Errorf("got %v", err)
+	}
+}
+
+func TestParseNewSyntax(t *testing.T) {
+	cases := map[string]string{
+		"[1, 2, 3]":                 "[1, 2, 3]",
+		"[]":                        "[]",
+		"[[1], [2, 3],]":            "[[1], [2, 3]]",
+		"a[0][1] + b.c.d":           "(a[0][1] + b.c.d)",
+		"P { x: 1, y: [2] }":        "P {x: 1, y: [2]}",
+		"geo.P { x: 1.5 }":          "geo.P {x: 1.5}",
+		"P {}":                      "P {}",
+		"f(P { x: 1 }).x":           "f(P {x: 1}).x",
+		"2.5e-3 * 1e9":              "(2.5e-3 * 1e9)",
+		"-a[i].b":                   "(-a[i].b)",
+		"m.f(1)[0]":                 "m.f(1)[0]",
+		"items[len(items) - 1].tag": "items[(len(items) - 1)].tag",
+	}
+	for src, want := range cases {
+		if got := exprString(parseExprForTest(t, src)); got != want {
+			t.Errorf("%s: got %s, want %s", src, got, want)
+		}
+	}
+	f, err := Parse("s.ks", []byte("pub struct Shape {\n    name: string,\n    pts: [[float]],\n    other: geo.Point,\n}\nstruct Empty {}\nfn main() {\n    var s = 1;\n    s = 2;\n    a[0].b[1] = 3;\n    if p == (P { x: 1 }) { }\n    while x < y.z { }\n}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Structs) != 2 || !f.Structs[0].Pub || f.Structs[0].Fields[1].Type.String() != "[[float]]" || f.Structs[0].Fields[2].Type.String() != "geo.Point" || len(f.Structs[1].Fields) != 0 {
+		t.Fatalf("bad structs: %+v", f.Structs)
+	}
+	a := f.Funcs[0].Body.Stmts[2].(*AssignStmt)
+	if exprString(a.Target) != "a[0].b[1]" {
+		t.Errorf("bad assign target %s", exprString(a.Target))
+	}
+	errCases := map[string]string{
+		"fn main() { if x == P { x: 1 } { } }": "p.ks:1:23: error: struct literals in if and while conditions must be wrapped in parentheses",
+		"fn main() { (a) = 1; }":               "",
+		"fn main() { f().x = 1; }":             "cannot assign to this expression",
+		"fn main() { let x = 1.; }":            "expected identifier after \".\"",
+		"fn main() { let x = 1e; }":            "invalid float literal 1e: missing exponent digits",
+		"fn main() { let x = 1e999; }":         "float literal 1e999 is out of range",
+		"struct { }":                           "expected identifier for struct name",
+		"fn main() { let a: [int = []; }":      "expected \"]\" to close array type",
+	}
+	for src, want := range errCases {
+		_, err := Parse("p.ks", []byte(src))
+		if want == "" {
+			if err != nil {
+				t.Errorf("%q: unexpected error %v", src, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", src, err, want)
+		}
 	}
 }

@@ -12,9 +12,10 @@ import (
 )
 
 type BuildOptions struct {
-	Output string
-	EmitC  string
-	CC     string
+	Output   string
+	EmitC    string
+	CC       string
+	Sanitize bool
 }
 
 func FindCC(override string) ([]string, error) {
@@ -47,10 +48,10 @@ func Build(entry string, opts BuildOptions) error {
 			return err
 		}
 	}
-	return CompileC(src, opts.Output, opts.CC)
+	return CompileC(src, opts.Output, opts.CC, opts.Sanitize)
 }
 
-func CompileC(src, output, ccOverride string) error {
+func CompileC(src, output, ccOverride string, sanitize bool) error {
 	cc, err := FindCC(ccOverride)
 	if err != nil {
 		return err
@@ -69,8 +70,12 @@ func CompileC(src, output, ccOverride string) error {
 		return err
 	}
 	built := filepath.Join(dir, "program.out")
-	args := append(cc[1:],
-		"-std=c11", "-O2",
+	opt := []string{"-O2"}
+	if sanitize {
+		opt = []string{"-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"}
+	}
+	args := append(append(cc[1:], "-std=c11"), opt...)
+	args = append(args,
 		"-Werror=implicit-function-declaration",
 		"-Werror=int-conversion",
 		"-Werror=incompatible-pointer-types",

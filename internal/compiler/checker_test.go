@@ -66,22 +66,22 @@ func TestTypeErrors(t *testing.T) {
 		{"fn f(a: int) {} fn main() { f(); }", "f expects 1 argument, got 0"},
 		{"fn f() {} fn main() { let x = f(); }", "function call does not produce a value"},
 		{"fn f() {} fn main() { print(f()); }", "function call does not produce a value"},
-		{"fn main() { let x: float = 1; }", "unknown type float (expected int, bool or string)"},
+		{"fn main() { let x: double = 1; }", "unknown type double"},
+		{"fn main() { let x: float = 1; }", "cannot initialize x of type float with value of type int"},
 		{"fn main() { nope(); }", "undefined function: nope"},
 		{"fn main() { let x = y; }", "undefined: y"},
 		{"fn f() {} fn main() { let x = f; }", "function f used as a value"},
 		{"fn main() { let f = 1; f(); }", "f is a variable of type int, not a function"},
 		{"fn f() {} fn f() {} fn main() {}", "function f already declared at 1:4"},
 		{"fn f(a: int, a: int) {} fn main() {}", "duplicate parameter a"},
-		{"fn len(s: string) -> int { return 0; } fn main() {}", "cannot redefine builtin function len"},
-		{"fn main() { let n = len(5); }", "argument 1 of len must be string, not int"},
+		{"fn main() { let n = len(5); }", "len expects a string or an array, not int"},
 		{"fn main() { break; }", "break outside of a while loop"},
 		{"fn main() { continue; }", "continue outside of a while loop"},
 		{"fn other() {}", "entry file has no function main"},
 		{"fn main(a: int) {}", "main must not take parameters"},
 		{"fn main() -> string { return \"\"; }", "main must return nothing or int, not string"},
-		{"fn main() { m.f(); }", "undefined module: m"},
-		{"import c \"stdlib.h\" { fn getenv(name: string) -> int; }\nfn main() {}", "c functions may only use int and bool parameters"},
+		{"fn main() { m.f(); }", "c.ks:1:13: error: undefined: m"},
+		{"import c \"stdlib.h\" { fn getenv(name: string) -> int; }\nfn main() {}", "c functions may only use int, bool and float parameters, not string"},
 		{"import c \"../etc/x.h\" { fn f() -> int; }\nfn main() {}", "invalid c header name \"../etc/x.h\""},
 		{"import c \"stdlib.h\" { fn ks_add(a: int) -> int; }\nfn main() {}", "c function name ks_add is reserved"},
 	}
@@ -110,7 +110,7 @@ func TestInvalidOperandsDoNotCascade(t *testing.T) {
 }
 
 func TestScoping(t *testing.T) {
-	expectError(t, "fn main() { let x = 1; x = 2; }", "cannot assign to x: it is immutable (declared with let at 1:17; use var to allow assignment)")
+	expectError(t, "fn main() { let x = 1; x = 2; }", "cannot assign to x: x is immutable (declared with let at 1:17; use var to allow assignment)")
 	expectError(t, "fn main() { { let inner = 1; } print(inner); }", "undefined: inner")
 	expectError(t, "fn main() { if true { var z = 1; } z = 2; }", "undefined: z")
 	expectError(t, "fn main() { while false { let w = 1; } print(w); }", "undefined: w")
@@ -228,5 +228,87 @@ func TestImportSymlinkEscape(t *testing.T) {
 	_, err := Load(filepath.Join(dir, "main.ks"))
 	if err == nil || !strings.Contains(err.Error(), "escapes the project directory") {
 		t.Errorf("expected symlink escape to be rejected, got %v", err)
+	}
+}
+
+func TestNewTypeErrors(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"fn main() { let a = []; }", "cannot infer the element type of an empty array literal"},
+		{"fn main() { let a = [1, \"x\"]; }", "array element 2 has type string, expected int"},
+		{"fn main() { let a = [1]; a[0] = 2; }", "cannot assign to a[...]: a is immutable"},
+		{"fn main() { let a = [1]; push(a, 2); }", "cannot assign to a: a is immutable"},
+		{"fn f(a: [int]) { a[0] = 1; } fn main() {}", "a is a parameter"},
+		{"fn main() { let s = \"abc\"; print(s[0]); }", "cannot index a string; use byte_at(s, i) or substr(s, start, count)"},
+		{"fn main() { var s = \"abc\"; s[0] = \"x\"; }", "cannot assign into a string; strings are immutable"},
+		{"fn main() { let a = [1]; print(a[true]); }", "array index must be int, not bool"},
+		{"fn main() { let x = 5; print(x[0]); }", "cannot index a value of type int"},
+		{"fn main() { print(1 + 1.0); }", "operator + is not defined for int and float (convert explicitly with float(...) or int(...))"},
+		{"fn main() { print(5 % 2.0); }", "operator % is not defined for int and float"},
+		{"fn main() { print(5.0 % 2.0); }", "operator % is not defined for float and float"},
+		{"fn main() { print([1] == [1]); }", "operator == is not defined for [int] (only int, bool, float and string values can be compared)"},
+		{"fn main() { var a = [1]; print(pop(a) + 1); }", "pop changes its array argument"},
+		{"fn main() { var a = [1]; print(len(a), push(a, 2)); }", "push changes its array argument"},
+		{"fn main() { var x = 1; push(x, 2); }", "push expects an array, not int"},
+		{"fn main() { var a = [1]; push(a, \"s\"); }", "cannot push string onto [int]"},
+		{"fn main() { push([1], 2); }", "the first argument of push must be a var, field or array element"},
+		{"fn main() { print(len(5)); }", "len expects a string or an array, not int"},
+		{"fn main() { print(str([1])); }", "str expects int, float, bool or string, not [int]"},
+		{"fn main() { print(min(1, 2.0)); }", "min expects two ints or two floats, not int and float"},
+		{"fn main() { print(slice(\"ab\", 0, 1)); }", "slice expects an array, not string (use substr for strings)"},
+		{"fn main() { print(sqrt(4)); }", "argument 1 of sqrt must be float, not int"},
+		{"fn main() { let x: [int] = [1.5]; }", "array element 1 has type float, expected int"},
+		{"struct P { x: int } fn main() { let p = P { x: 1, y: 2 }; }", "struct P has no field y"},
+		{"struct P { x: int, y: int } fn main() { let p = P { x: 1 }; }", "missing field in P literal: y"},
+		{"struct P { x: int } fn main() { let p = P { x: 1, x: 2 }; }", "field x given more than once"},
+		{"struct P { x: int } fn main() { let p = P { x: \"s\" }; }", "field x of P must be int, not string"},
+		{"struct P { x: int } fn main() { let p = P { x: 1 }; print(p.z); }", "struct P has no field z"},
+		{"fn main() { let a = [1]; print(a.len); }", "type [int] has no field len (use len(...) for the length of a [int])"},
+		{"fn main() { let p = Q { x: 1 }; }", "unknown struct Q"},
+		{"struct P { x: int, x: int } fn main() {}", "field x already declared"},
+		{"struct P { x: Missing } fn main() {}", "unknown type Missing"},
+		{"struct P { x: int } struct P { y: int } fn main() {}", "struct P already declared"},
+		{"struct int { x: int } fn main() {}", "cannot use builtin type name int as a struct name"},
+		{"struct A { b: B } struct B { a: A } fn main() {}", "struct A contains itself through its fields"},
+		{"struct A { kids: [A] } fn main() { let a = A { kids: [] }; print(a); }", ""},
+		{"struct P { x: int } fn P() {} fn main() {}", "P already declared as a struct"},
+		{"struct P { x: int } fn main() { print(P); }", "struct P used as a value"},
+		{"struct P { x: int } fn main() { let p = P { x: 1 }; p.x = 2; }", "cannot assign to p.x: p is immutable"},
+		{"struct P { x: int } fn main() { let p = P { x: 1 }; p.x(); }", "p.x is not a function"},
+		{"fn main() { exit(\"x\"); }", "argument 1 of exit must be int, not string"},
+		{"import c \"math.h\" { fn cbrt(x: float) -> float; }\nfn main() { print(cbrt(8.0)); }", ""},
+		{"import c \"stdlib.h\" { fn f(s: [int]); }\nfn main() {}", "c functions may only use int, bool and float parameters, not [int]"},
+	}
+	for _, c := range cases {
+		if c.want == "" {
+			expectOK(t, c.src)
+		} else {
+			expectError(t, c.src, c.want)
+		}
+	}
+}
+
+func TestModuleStructs(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"main.ks":     "import \"geo.ks\";\nfn main() { let p = geo.Point { x: 1.0, y: 2.0 }; let q: geo.Point = geo.origin(); print(geo.dist(p, q)); }",
+		"geo.ks":      "pub struct Point { x: float, y: float }\nstruct Hidden { a: int }\npub fn origin() -> Point { return Point { x: 0.0, y: 0.0 }; }\npub fn dist(a: Point, b: Point) -> float { return sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }",
+		"private.ks":  "import \"geo.ks\";\nfn main() { let h = geo.Hidden { a: 1 }; }",
+		"privtype.ks": "import \"geo.ks\";\nfn f(h: geo.Hidden) {}\nfn main() {}",
+		"nomod.ks":    "fn main() { let h = nope.Thing { a: 1 }; }",
+	})
+	if _, err := Load(filepath.Join(dir, "main.ks")); err != nil {
+		t.Fatalf("valid module struct program failed: %v", err)
+	}
+	for file, want := range map[string]string{
+		"private.ks":  "struct geo.Hidden is not public (declare it with pub struct)",
+		"privtype.ks": "struct geo.Hidden is not public",
+		"nomod.ks":    "undefined module: nope",
+	} {
+		_, err := Load(filepath.Join(dir, file))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want %q", file, err, want)
+		}
 	}
 }

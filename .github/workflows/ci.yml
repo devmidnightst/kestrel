@@ -35,6 +35,8 @@ jobs:
         run: go test -race -count=1 ./...
       - name: random programs
         run: KESTREL_RANDOM_PROGRAMS=200 go test -count=1 -run TestRandomProgramsCompileAndRun ./internal/compiler
+      - name: random programs under sanitizers
+        run: KESTREL_RANDOM_PROGRAMS=200 go test -count=1 -v -run TestRandomProgramsUnderSanitizers ./internal/compiler
       - name: fuzz
         run: |
           for target in FuzzLex FuzzParse FuzzCheckAndGenerate; do
@@ -44,5 +46,5 @@ jobs:
         run: |
           go build -o kestrel ./cmd/kestrel
           for f in examples/*.ks examples/modules/main.ks; do
-            ./kestrel run "$f" > /dev/null
+            ./kestrel run "$f" < /dev/null > /dev/null
           done

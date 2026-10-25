@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -112,6 +113,8 @@ var oneCharOps = map[rune]Kind{
 	')': RParen,
 	'{': LBrace,
 	'}': RBrace,
+	'[': LBracket,
+	']': RBracket,
 	',': Comma,
 	';': Semicolon,
 	':': Colon,
@@ -137,18 +140,7 @@ func (lx *lexer) next() (Token, error) {
 		}
 		return Token{Kind: IdentTok, Text: text, Pos: start}, nil
 	case isDigit(r):
-		begin := lx.off
-		for !lx.atEnd() && isDigit(lx.peek(0)) {
-			lx.advance()
-		}
-		if !lx.atEnd() && isLetter(lx.peek(0)) {
-			return Token{}, errorf(lx.pos(), "invalid character %q in integer literal", lx.peek(0))
-		}
-		text := string(lx.src[begin:lx.off])
-		if v, err := strconv.ParseUint(text, 10, 64); err != nil || v > 1<<63 {
-			return Token{}, errorf(start, "integer literal %s does not fit in a signed 64-bit int", text)
-		}
-		return Token{Kind: IntTok, Text: text, Pos: start}, nil
+		return lx.lexNumber(start)
 	case r == '"':
 		return lx.lexString(start)
 	}
@@ -208,4 +200,49 @@ func (lx *lexer) lexString(start Pos) (Token, error) {
 			sb.WriteRune(r)
 		}
 	}
+}
+
+func (lx *lexer) digits() int {
+	n := 0
+	for !lx.atEnd() && isDigit(lx.peek(0)) {
+		lx.advance()
+		n++
+	}
+	return n
+}
+
+func (lx *lexer) lexNumber(start Pos) (Token, error) {
+	begin := lx.off
+	lx.digits()
+	isFloat := false
+	if lx.peek(0) == '.' && isDigit(lx.peek(1)) {
+		isFloat = true
+		lx.advance()
+		lx.digits()
+	}
+	if lx.peek(0) == 'e' || lx.peek(0) == 'E' {
+		isFloat = true
+		lx.advance()
+		if lx.peek(0) == '+' || lx.peek(0) == '-' {
+			lx.advance()
+		}
+		if lx.digits() == 0 {
+			return Token{}, errorf(start, "invalid float literal %s: missing exponent digits", string(lx.src[begin:lx.off]))
+		}
+	}
+	if !lx.atEnd() && isLetter(lx.peek(0)) {
+		return Token{}, errorf(lx.pos(), "invalid character %q in number literal", lx.peek(0))
+	}
+	text := string(lx.src[begin:lx.off])
+	if isFloat {
+		v, err := strconv.ParseFloat(text, 64)
+		if err != nil || math.IsInf(v, 0) {
+			return Token{}, errorf(start, "float literal %s is out of range", text)
+		}
+		return Token{Kind: FloatTok, Text: text, Pos: start}, nil
+	}
+	if v, err := strconv.ParseUint(text, 10, 64); err != nil || v > 1<<63 {
+		return Token{}, errorf(start, "integer literal %s does not fit in a signed 64-bit int", text)
+	}
+	return Token{Kind: IntTok, Text: text, Pos: start}, nil
 }

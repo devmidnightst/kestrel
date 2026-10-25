@@ -4,18 +4,33 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 type gen struct {
-	prog *Program
-	sb   strings.Builder
-	ind  int
+	prog       *Program
+	info       *Info
+	lits       map[string]string
+	litDecls   strings.Builder
+	printFns   map[Type]string
+	printProto strings.Builder
+	printDefs  strings.Builder
 }
 
 func GenerateC(prog *Program) string {
-	g := &gen{prog: prog}
-	g.sb.WriteString(runtimeC)
+	g := &gen{prog: prog, info: prog.Info, lits: map[string]string{}, printFns: map[Type]string{}}
+	var body strings.Builder
+	for _, m := range prog.Modules {
+		for _, fn := range m.Order {
+			if !fn.Extern {
+				f := &fnGen{g: g, out: &body}
+				f.function(fn)
+			}
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(runtimeC())
 	headers := map[string]bool{}
 	for _, m := range prog.Modules {
 		for _, h := range m.Headers {
@@ -28,63 +43,192 @@ func GenerateC(prog *Program) string {
 			names = append(names, h)
 		}
 		sort.Strings(names)
-		g.sb.WriteString("\n")
+		sb.WriteString("\n")
 		for _, h := range names {
-			fmt.Fprintf(&g.sb, "#include <%s>\n", h)
+			fmt.Fprintf(&sb, "#include <%s>\n", h)
 		}
 	}
-	g.sb.WriteString("\n")
+	for _, si := range prog.Structs {
+		g.structDef(&sb, si)
+	}
+	sb.WriteString("\n")
+	sb.WriteString(g.litDecls.String())
 	externs := map[string]bool{}
 	for _, m := range prog.Modules {
 		for _, fn := range m.Order {
 			if fn.Extern && !externs[fn.CName] {
 				externs[fn.CName] = true
-				g.externWrapper(fn)
+				externWrapper(&sb, fn)
 			}
 		}
 	}
+	sb.WriteString(g.printProto.String())
 	for _, m := range prog.Modules {
 		for _, fn := range m.Order {
 			if !fn.Extern {
-				fmt.Fprintf(&g.sb, "static %s;\n", g.prototype(fn))
+				fmt.Fprintf(&sb, "static %s;\n", prototype(fn))
 			}
 		}
 	}
-	for _, m := range prog.Modules {
-		for _, fn := range m.Order {
-			if !fn.Extern {
-				g.function(fn)
-			}
-		}
-	}
-	g.sb.WriteString("\nint main(void) {\n")
-	g.sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
+	sb.WriteString(g.printDefs.String())
+	sb.WriteString(body.String())
+	sb.WriteString("\nint main(int argc, char **argv) {\n")
+	sb.WriteString("\tks_argc = argc;\n\tks_argv = argv;\n")
+	sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
+	sb.WriteString("\tks_init_stack((uintptr_t)__builtin_frame_address(0));\n")
 	if prog.Main.Result == IntType {
-		fmt.Fprintf(&g.sb, "\tint64_t ks_rc = %s();\n\tfflush(stdout);\n\treturn (int)ks_rc;\n", prog.Main.CName)
+		fmt.Fprintf(&sb, "\tint64_t ks_rc = %s();\n\tfflush(stdout);\n\treturn (int)ks_rc;\n", prog.Main.CName)
 	} else {
-		fmt.Fprintf(&g.sb, "\t%s();\n\tfflush(stdout);\n\treturn 0;\n", prog.Main.CName)
+		fmt.Fprintf(&sb, "\t%s();\n\tfflush(stdout);\n\treturn 0;\n", prog.Main.CName)
 	}
-	g.sb.WriteString("}\n")
-	return g.sb.String()
+	sb.WriteString("}\n")
+	return sb.String()
 }
 
 func cType(t Type) string {
-	switch t {
-	case IntType:
+	switch t.Kind {
+	case KInt:
 		return "int64_t"
-	case BoolType:
+	case KBool:
 		return "bool"
-	case StringType:
-		return "const char *"
+	case KFloat:
+		return "double"
+	case KString, KArray, KStruct:
+		return "ks_obj *"
 	}
 	return "void"
 }
 
-func externCName(fn *Func) string {
-	return "ks_c_" + fn.CName
+func zeroValue(t Type) string {
+	switch t.Kind {
+	case KBool:
+		return "false"
+	case KFloat:
+		return "0.0"
+	case KString, KArray, KStruct:
+		return "NULL"
+	}
+	return "0"
 }
 
-func (g *gen) prototype(fn *Func) string {
+func arrKind(elem Type) string {
+	switch elem.Kind {
+	case KInt:
+		return "i64"
+	case KBool:
+		return "bool"
+	case KFloat:
+		return "f64"
+	}
+	return "obj"
+}
+
+func (g *gen) structDef(sb *strings.Builder, si *StructInfo) {
+	n := si.CName
+	sb.WriteString("\ntypedef struct {\n\tks_obj h;\n")
+	for _, f := range si.Fields {
+		fmt.Fprintf(sb, "\t%s f_%s;\n", cType(f.Type), f.Name)
+	}
+	fmt.Fprintf(sb, "} %s;\n\n", n)
+	fmt.Fprintf(sb, "KS_RT void %s_drop(ks_obj *o) {\n\t%s *s = (%s *)o;\n", n, n, n)
+	for _, f := range si.Fields {
+		if f.Type.Managed() {
+			fmt.Fprintf(sb, "\tks_release(s->f_%s);\n", f.Name)
+		}
+	}
+	sb.WriteString("\t(void)s;\n\tfree(o);\n}\n\n")
+	fmt.Fprintf(sb, "KS_RT ks_obj *%s_clone(ks_obj *o) {\n\t%s *c = ks_alloc(sizeof *c);\n\t*c = *(%s *)o;\n\tks_init_obj(&c->h, %s_drop, %s_clone);\n", n, n, n, n, n)
+	for _, f := range si.Fields {
+		if f.Type.Managed() {
+			fmt.Fprintf(sb, "\tks_retain(c->f_%s);\n", f.Name)
+		}
+	}
+	sb.WriteString("\treturn &c->h;\n}\n\n")
+	params := []string{}
+	for _, f := range si.Fields {
+		params = append(params, fmt.Sprintf("%s f_%s", cType(f.Type), f.Name))
+	}
+	if len(params) == 0 {
+		params = []string{"void"}
+	}
+	fmt.Fprintf(sb, "KS_RT ks_obj *%s_new(%s) {\n\t%s *s = ks_alloc(sizeof *s);\n\tks_init_obj(&s->h, %s_drop, %s_clone);\n", n, strings.Join(params, ", "), n, n, n)
+	for _, f := range si.Fields {
+		fmt.Fprintf(sb, "\ts->f_%s = f_%s;\n", f.Name, f.Name)
+	}
+	sb.WriteString("\treturn &s->h;\n}\n")
+}
+
+func (g *gen) literal(s string) string {
+	if name, ok := g.lits[s]; ok {
+		return name
+	}
+	name := fmt.Sprintf("ks_lit%d", len(g.lits))
+	g.lits[s] = name
+	fmt.Fprintf(&g.litDecls, "static ks_str %s = {{-1, NULL, NULL, NULL}, %d, %s};\n", name, len(s), cString(s))
+	return name
+}
+
+func printScalar(t Type, x string, quoted bool) string {
+	switch t.Kind {
+	case KInt:
+		return fmt.Sprintf("ks_print_i64(%s);", x)
+	case KBool:
+		return fmt.Sprintf("ks_print_bool(%s);", x)
+	case KFloat:
+		return fmt.Sprintf("ks_print_f64(%s);", x)
+	case KString:
+		if quoted {
+			return fmt.Sprintf("ks_print_str_quoted(%s);", x)
+		}
+		return fmt.Sprintf("ks_print_str(%s);", x)
+	}
+	return ""
+}
+
+func (g *gen) printValue(t Type, x string, quoted bool) string {
+	if t.Kind == KArray || t.Kind == KStruct {
+		return fmt.Sprintf("%s(%s);", g.printFn(t), x)
+	}
+	return printScalar(t, x, quoted)
+}
+
+func (g *gen) printFn(t Type) string {
+	if name, ok := g.printFns[t]; ok {
+		return name
+	}
+	name := fmt.Sprintf("ks_print_t%d", len(g.printFns))
+	g.printFns[t] = name
+	fmt.Fprintf(&g.printProto, "static void %s(ks_obj *v);\n", name)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\nstatic void %s(ks_obj *v) {\n\tks_stack_check();\n", name)
+	if t.Kind == KArray {
+		k := arrKind(t.Elem)
+		fmt.Fprintf(&sb, "\tks_arr_%s *a = (ks_arr_%s *)v;\n\tputchar('[');\n", k, k)
+		sb.WriteString("\tfor (int64_t i = 0; i < a->len; i++) {\n\t\tif (i > 0) fputs(\", \", stdout);\n")
+		fmt.Fprintf(&sb, "\t\t%s\n\t}\n\tputchar(']');\n", g.printValue(t.Elem, "a->data[i]", true))
+	} else {
+		si := t.Struct
+		fmt.Fprintf(&sb, "\t%s *s = (%s *)v;\n\t(void)s;\n", si.CName, si.CName)
+		if len(si.Fields) == 0 {
+			fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n", cString(si.Name+" {}"))
+		} else {
+			fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n", cString(si.Name+" { "))
+			for i, f := range si.Fields {
+				prefix := f.Name + ": "
+				if i > 0 {
+					prefix = ", " + prefix
+				}
+				fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n\t%s\n", cString(prefix), g.printValue(f.Type, "s->f_"+f.Name, true))
+			}
+			sb.WriteString("\tfputs(\" }\", stdout);\n")
+		}
+	}
+	sb.WriteString("}\n")
+	g.printDefs.WriteString(sb.String())
+	return name
+}
+
+func prototype(fn *Func) string {
 	params := make([]string, len(fn.Params))
 	for i, p := range fn.Params {
 		params[i] = fmt.Sprintf("%s %s", cType(p.Type), p.CName)
@@ -95,7 +239,11 @@ func (g *gen) prototype(fn *Func) string {
 	return fmt.Sprintf("%s %s(%s)", cType(fn.Result), fn.CName, strings.Join(params, ", "))
 }
 
-func (g *gen) externWrapper(fn *Func) {
+func externCName(fn *Func) string {
+	return "ks_c_" + fn.CName
+}
+
+func externWrapper(sb *strings.Builder, fn *Func) {
 	params := make([]string, len(fn.Params))
 	args := make([]string, len(fn.Params))
 	for i, p := range fn.Params {
@@ -108,194 +256,10 @@ func (g *gen) externWrapper(fn *Func) {
 	}
 	call := fmt.Sprintf("%s(%s)", fn.CName, strings.Join(args, ", "))
 	if fn.Result == Void {
-		fmt.Fprintf(&g.sb, "static void %s(%s) {\n\t%s;\n}\n\n", externCName(fn), sig, call)
+		fmt.Fprintf(sb, "static void %s(%s) {\n\t%s;\n}\n\n", externCName(fn), sig, call)
 	} else {
-		fmt.Fprintf(&g.sb, "static %s %s(%s) {\n\treturn %s;\n}\n\n", cType(fn.Result), externCName(fn), sig, call)
+		fmt.Fprintf(sb, "static %s %s(%s) {\n\treturn %s;\n}\n\n", cType(fn.Result), externCName(fn), sig, call)
 	}
-}
-
-func (g *gen) line(format string, args ...any) {
-	g.sb.WriteString(strings.Repeat("\t", g.ind))
-	fmt.Fprintf(&g.sb, format, args...)
-	g.sb.WriteString("\n")
-}
-
-func (g *gen) function(fn *Func) {
-	g.sb.WriteString("\n")
-	fmt.Fprintf(&g.sb, "static %s {\n", g.prototype(fn))
-	g.ind = 1
-	for _, p := range fn.Params {
-		g.line("(void)%s;", p.CName)
-	}
-	g.stmts(fn.Decl.Body.Stmts)
-	g.ind = 0
-	g.sb.WriteString("}\n")
-}
-
-func (g *gen) stmts(list []Stmt) {
-	for _, s := range list {
-		g.stmt(s)
-	}
-}
-
-func (g *gen) block(b *Block) {
-	g.ind++
-	g.stmts(b.Stmts)
-	g.ind--
-}
-
-func (g *gen) stmt(s Stmt) {
-	info := g.prog.Info
-	switch s := s.(type) {
-	case *LetStmt:
-		v := info.Defs[s]
-		g.line("%s %s = %s;", cType(v.Type), v.CName, g.expr(s.Value))
-		g.line("(void)%s;", v.CName)
-	case *AssignStmt:
-		g.line("%s = %s;", g.lookupAssign(s), g.expr(s.Value))
-	case *IfStmt:
-		g.ifChain(s, false)
-	case *WhileStmt:
-		g.line("while (%s) {", g.cond(s.Cond))
-		g.block(s.Body)
-		g.line("}")
-	case *ReturnStmt:
-		if s.Value == nil {
-			g.line("return;")
-		} else {
-			g.line("return %s;", g.expr(s.Value))
-		}
-	case *PrintStmt:
-		for i, a := range s.Args {
-			if i > 0 {
-				g.line("putchar(' ');")
-			}
-			switch info.Types[a] {
-			case IntType:
-				g.line("ks_print_int(%s);", g.expr(a))
-			case BoolType:
-				g.line("ks_print_bool(%s);", g.expr(a))
-			case StringType:
-				g.line("ks_print_string(%s);", g.expr(a))
-			}
-		}
-		g.line("putchar('\\n');")
-	case *ExprStmt:
-		g.line("%s;", g.expr(s.X))
-	case *BreakStmt:
-		g.line("break;")
-	case *ContinueStmt:
-		g.line("continue;")
-	case *BlockStmt:
-		g.line("{")
-		g.block(s.Block)
-		g.line("}")
-	default:
-		panic(fmt.Sprintf("unexpected statement %T", s))
-	}
-}
-
-func (g *gen) lookupAssign(s *AssignStmt) string {
-	return g.prog.Info.Assigns[s].CName
-}
-
-func (g *gen) ifChain(s *IfStmt, chained bool) {
-	if chained {
-		g.sb.WriteString(fmt.Sprintf("if (%s) {\n", g.cond(s.Cond)))
-	} else {
-		g.line("if (%s) {", g.cond(s.Cond))
-	}
-	g.block(s.Then)
-	switch e := s.Else.(type) {
-	case nil:
-		g.line("}")
-	case *IfStmt:
-		g.sb.WriteString(strings.Repeat("\t", g.ind) + "} else ")
-		g.ifChain(e, true)
-	case *BlockStmt:
-		g.line("} else {")
-		g.block(e.Block)
-		g.line("}")
-	}
-}
-
-var cBinaryOps = map[Kind]string{
-	Less:      "<",
-	LessEq:    "<=",
-	Greater:   ">",
-	GreaterEq: ">=",
-	AndAnd:    "&&",
-	OrOr:      "||",
-}
-
-var checkedOps = map[Kind]string{
-	Plus:    "ks_add",
-	Minus:   "ks_sub",
-	Star:    "ks_mul",
-	Slash:   "ks_div",
-	Percent: "ks_mod",
-}
-
-func (g *gen) expr(e Expr) string {
-	info := g.prog.Info
-	switch e := e.(type) {
-	case *IntLit:
-		if e.Value == math.MinInt64 {
-			return "INT64_MIN"
-		}
-		return fmt.Sprintf("INT64_C(%d)", e.Value)
-	case *StringLit:
-		return cString(e.Value)
-	case *BoolLit:
-		if e.Value {
-			return "true"
-		}
-		return "false"
-	case *Ident:
-		return info.Uses[e].CName
-	case *UnaryExpr:
-		if e.Op == Minus {
-			return fmt.Sprintf("ks_neg(%s)", g.expr(e.X))
-		}
-		return fmt.Sprintf("(!%s)", g.expr(e.X))
-	case *BinaryExpr:
-		x, y := g.expr(e.X), g.expr(e.Y)
-		operand := info.Types[e.X]
-		switch e.Op {
-		case Plus:
-			if operand == StringType {
-				return fmt.Sprintf("ks_concat(%s, %s)", x, y)
-			}
-		case Eq, NotEq:
-			neg := ""
-			if e.Op == NotEq {
-				neg = "!"
-			}
-			if operand == StringType {
-				return fmt.Sprintf("(%sks_streq(%s, %s))", neg, x, y)
-			}
-			if neg == "" {
-				return fmt.Sprintf("(%s == %s)", x, y)
-			}
-			return fmt.Sprintf("(%s != %s)", x, y)
-		}
-		if fn, ok := checkedOps[e.Op]; ok {
-			return fmt.Sprintf("%s(%s, %s)", fn, x, y)
-		}
-		return fmt.Sprintf("(%s %s %s)", x, cBinaryOps[e.Op], y)
-	case *CallExpr:
-		fn := info.Calls[e]
-		args := make([]string, len(e.Args))
-		for i, a := range e.Args {
-			args[i] = g.expr(a)
-		}
-		name := fn.CName
-		if fn.Extern {
-			name = externCName(fn)
-		}
-		return fmt.Sprintf("%s(%s)", name, strings.Join(args, ", "))
-	}
-	panic(fmt.Sprintf("unexpected expression %T", e))
 }
 
 func cString(s string) string {
@@ -325,28 +289,17 @@ func cString(s string) string {
 	return sb.String()
 }
 
-func (g *gen) cond(e Expr) string {
-	s := g.expr(e)
-	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
-		return s
+func floatLiteral(v float64) string {
+	s := strconv.FormatFloat(v, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".e") {
+		s += ".0"
 	}
-	depth := 0
-	inString := false
-	for i := 0; i < len(s); i++ {
-		switch {
-		case inString && s[i] == '\\':
-			i++
-		case s[i] == '"':
-			inString = !inString
-		case inString:
-		case s[i] == '(':
-			depth++
-		case s[i] == ')':
-			depth--
-			if depth == 0 && i != len(s)-1 {
-				return s
-			}
-		}
+	return s
+}
+
+func intLiteral(v int64) string {
+	if v == math.MinInt64 {
+		return "INT64_MIN"
 	}
-	return s[1 : len(s)-1]
+	return fmt.Sprintf("INT64_C(%d)", v)
 }

@@ -18,6 +18,7 @@ type File struct {
 	Path     string
 	Imports  []*Import
 	CImports []*CImport
+	Structs  []*StructDecl
 	Funcs    []*FuncDecl
 }
 
@@ -37,8 +38,34 @@ type CImport struct {
 }
 
 type TypeExpr struct {
+	Pos    Pos
+	Name   string
+	Module string
+	Elem   *TypeExpr
+}
+
+func (t *TypeExpr) String() string {
+	switch {
+	case t.Elem != nil:
+		return "[" + t.Elem.String() + "]"
+	case t.Module != "":
+		return t.Module + "." + t.Name
+	}
+	return t.Name
+}
+
+type StructDecl struct {
+	Pos     Pos
+	NamePos Pos
+	Pub     bool
+	Name    string
+	Fields  []*FieldDecl
+}
+
+type FieldDecl struct {
 	Pos  Pos
 	Name string
+	Type *TypeExpr
 }
 
 type Param struct {
@@ -74,9 +101,9 @@ type LetStmt struct {
 }
 
 type AssignStmt struct {
-	Pos   Pos
-	Name  string
-	Value Expr
+	Pos    Pos
+	Target Expr
+	Value  Expr
 }
 
 type IfStmt struct {
@@ -125,6 +152,12 @@ type IntLit struct {
 	Value int64
 }
 
+type FloatLit struct {
+	Pos   Pos
+	Text  string
+	Value float64
+}
+
 type StringLit struct {
 	Pos   Pos
 	Value string
@@ -160,9 +193,32 @@ type CallExpr struct {
 }
 
 type SelectorExpr struct {
-	Pos  Pos
-	X    *Ident
-	Name string
+	X       Expr
+	Name    string
+	NamePos Pos
+}
+
+type IndexExpr struct {
+	X     Expr
+	Index Expr
+}
+
+type ArrayLit struct {
+	Pos   Pos
+	Elems []Expr
+}
+
+type StructLit struct {
+	Pos    Pos
+	Module string
+	Name   string
+	Fields []*FieldInit
+}
+
+type FieldInit struct {
+	Pos   Pos
+	Name  string
+	Value Expr
 }
 
 func (b *Block) P() Pos        { return b.Pos }
@@ -177,13 +233,17 @@ func (s *BreakStmt) P() Pos    { return s.Pos }
 func (s *ContinueStmt) P() Pos { return s.Pos }
 func (s *BlockStmt) P() Pos    { return s.Block.Pos }
 func (e *IntLit) P() Pos       { return e.Pos }
+func (e *FloatLit) P() Pos     { return e.Pos }
 func (e *StringLit) P() Pos    { return e.Pos }
 func (e *BoolLit) P() Pos      { return e.Pos }
 func (e *Ident) P() Pos        { return e.Pos }
 func (e *UnaryExpr) P() Pos    { return e.Pos }
 func (e *BinaryExpr) P() Pos   { return e.Pos }
 func (e *CallExpr) P() Pos     { return e.Pos }
-func (e *SelectorExpr) P() Pos { return e.Pos }
+func (e *SelectorExpr) P() Pos { return e.X.P() }
+func (e *IndexExpr) P() Pos    { return e.X.P() }
+func (e *ArrayLit) P() Pos     { return e.Pos }
+func (e *StructLit) P() Pos    { return e.Pos }
 
 func (*LetStmt) stmtNode()      {}
 func (*AssignStmt) stmtNode()   {}
@@ -197,6 +257,7 @@ func (*ContinueStmt) stmtNode() {}
 func (*BlockStmt) stmtNode()    {}
 
 func (*IntLit) exprNode()       {}
+func (*FloatLit) exprNode()     {}
 func (*StringLit) exprNode()    {}
 func (*BoolLit) exprNode()      {}
 func (*Ident) exprNode()        {}
@@ -204,3 +265,6 @@ func (*UnaryExpr) exprNode()    {}
 func (*BinaryExpr) exprNode()   {}
 func (*CallExpr) exprNode()     {}
 func (*SelectorExpr) exprNode() {}
+func (*IndexExpr) exprNode()    {}
+func (*ArrayLit) exprNode()     {}
+func (*StructLit) exprNode()    {}

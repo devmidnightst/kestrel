@@ -10,20 +10,10 @@ const minIntMagnitude = "9223372036854775808"
 const maxNesting = 256
 
 type parser struct {
-	toks  []Token
-	pos   int
-	depth int
-}
-
-func (p *parser) enter() {
-	p.depth++
-	if p.depth > maxNesting {
-		p.fail(p.tok().Pos, "nesting too deep (more than %d levels)", maxNesting)
-	}
-}
-
-func (p *parser) leave() {
-	p.depth--
+	toks     []Token
+	pos      int
+	depth    int
+	noStruct bool
 }
 
 type parseBailout struct {
@@ -46,6 +36,17 @@ func Parse(file string, src []byte) (f *File, err error) {
 		}
 	}()
 	return p.parseFile(file), nil
+}
+
+func (p *parser) enter() {
+	p.depth++
+	if p.depth > maxNesting {
+		p.fail(p.tok().Pos, "nesting too deep (more than %d levels)", maxNesting)
+	}
+}
+
+func (p *parser) leave() {
+	p.depth--
 }
 
 func (p *parser) tok() Token {
@@ -91,19 +92,32 @@ func (p *parser) expectIdent(context string) Token {
 	return p.next()
 }
 
+func (p *parser) withStructLits(fn func()) {
+	saved := p.noStruct
+	p.noStruct = false
+	fn()
+	p.noStruct = saved
+}
+
 func (p *parser) parseFile(path string) *File {
 	f := &File{Path: path}
 	for p.at(KwImport) {
 		p.parseImport(f)
 	}
 	for !p.at(EOF) {
-		switch p.tok().Kind {
-		case KwFn, KwPub:
+		kind := p.tok().Kind
+		if kind == KwPub {
+			kind = p.peekKind(1)
+		}
+		switch {
+		case kind == KwFn:
 			f.Funcs = append(f.Funcs, p.parseFunc())
-		case KwImport:
-			p.fail(p.tok().Pos, "imports must appear before all function declarations")
+		case kind == KwStruct:
+			f.Structs = append(f.Structs, p.parseStruct())
+		case p.at(KwImport):
+			p.fail(p.tok().Pos, "imports must appear before all declarations")
 		default:
-			p.fail(p.tok().Pos, "expected function declaration, found %s", p.tok().describe())
+			p.fail(p.tok().Pos, "expected function or struct declaration, found %s", p.tok().describe())
 		}
 	}
 	return f
@@ -146,6 +160,30 @@ func (p *parser) parseImport(f *File) {
 	f.Imports = append(f.Imports, imp)
 }
 
+func (p *parser) parseStruct() *StructDecl {
+	start := p.tok().Pos
+	pub := false
+	if p.at(KwPub) {
+		pub = true
+		p.next()
+	}
+	p.expect(KwStruct, "to begin struct declaration")
+	name := p.expectIdent("for struct name")
+	decl := &StructDecl{Pos: start, NamePos: name.Pos, Pub: pub, Name: name.Text}
+	p.expect(LBrace, "after struct name")
+	for !p.at(RBrace) {
+		fn := p.expectIdent("for field name")
+		p.expect(Colon, "after field name")
+		decl.Fields = append(decl.Fields, &FieldDecl{Pos: fn.Pos, Name: fn.Text, Type: p.parseType()})
+		if !p.at(Comma) {
+			break
+		}
+		p.next()
+	}
+	p.expect(RBrace, "to close struct declaration")
+	return decl
+}
+
 func (p *parser) parseFunc() *FuncDecl {
 	start := p.tok().Pos
 	pub := false
@@ -181,8 +219,22 @@ func (p *parser) parseSignature(start Pos, pub bool) *FuncDecl {
 }
 
 func (p *parser) parseType() *TypeExpr {
+	p.enter()
+	defer p.leave()
+	if p.at(LBracket) {
+		lb := p.next()
+		elem := p.parseType()
+		p.expect(RBracket, "to close array type")
+		return &TypeExpr{Pos: lb.Pos, Elem: elem}
+	}
 	t := p.expectIdent("for type")
-	return &TypeExpr{Pos: t.Pos, Name: t.Text}
+	te := &TypeExpr{Pos: t.Pos, Name: t.Text}
+	if p.at(Dot) {
+		p.next()
+		n := p.expectIdent("for type name after \".\"")
+		te.Module, te.Name = t.Text, n.Text
+	}
+	return te
 }
 
 func (p *parser) parseBlock() *Block {
@@ -190,14 +242,40 @@ func (p *parser) parseBlock() *Block {
 	defer p.leave()
 	lb := p.expect(LBrace, "to open block")
 	b := &Block{Pos: lb.Pos}
+	saved := p.noStruct
+	p.noStruct = false
 	for !p.at(RBrace) {
 		if p.at(EOF) {
 			p.fail(p.tok().Pos, "unexpected end of file, expected \"}\" to close block opened at %d:%d", lb.Pos.Line, lb.Pos.Col)
 		}
 		b.Stmts = append(b.Stmts, p.parseStmt())
 	}
+	p.noStruct = saved
 	b.End = p.next().Pos
 	return b
+}
+
+func (p *parser) parseCond() Expr {
+	saved := p.noStruct
+	p.noStruct = true
+	x := p.parseExpr()
+	p.noStruct = saved
+	if p.at(LBrace) && p.peekKind(1) == IdentTok && p.peekKind(2) == Colon {
+		p.fail(p.tok().Pos, "struct literals in if and while conditions must be wrapped in parentheses")
+	}
+	return x
+}
+
+func isPlace(e Expr) bool {
+	switch e := e.(type) {
+	case *Ident:
+		return true
+	case *IndexExpr:
+		return isPlace(e.X)
+	case *SelectorExpr:
+		return isPlace(e.X)
+	}
+	return false
 }
 
 func (p *parser) parseStmt() Stmt {
@@ -219,7 +297,7 @@ func (p *parser) parseStmt() Stmt {
 		return p.parseIf()
 	case KwWhile:
 		p.next()
-		cond := p.parseExpr()
+		cond := p.parseCond()
 		return &WhileStmt{Pos: t.Pos, Cond: cond, Body: p.parseBlock()}
 	case KwReturn:
 		p.next()
@@ -245,18 +323,16 @@ func (p *parser) parseStmt() Stmt {
 		return &ContinueStmt{Pos: t.Pos}
 	case LBrace:
 		return &BlockStmt{Block: p.parseBlock()}
-	case IdentTok:
-		if p.peekKind(1) == Assign {
-			p.next()
-			p.next()
-			s := &AssignStmt{Pos: t.Pos, Name: t.Text, Value: p.parseExpr()}
-			p.expect(Semicolon, "after assignment")
-			return s
-		}
 	}
 	x := p.parseExpr()
 	if p.at(Assign) {
-		p.fail(p.tok().Pos, "only a plain variable name can be assigned to")
+		if !isPlace(x) {
+			p.fail(p.tok().Pos, "cannot assign to this expression (only variables, struct fields and array elements can be assigned)")
+		}
+		p.next()
+		s := &AssignStmt{Pos: t.Pos, Target: x, Value: p.parseExpr()}
+		p.expect(Semicolon, "after assignment")
+		return s
 	}
 	if _, ok := x.(*CallExpr); !ok {
 		p.fail(t.Pos, "expression result is unused; only function calls may be used as statements")
@@ -269,7 +345,7 @@ func (p *parser) parseIf() Stmt {
 	p.enter()
 	defer p.leave()
 	t := p.expect(KwIf, "")
-	s := &IfStmt{Pos: t.Pos, Cond: p.parseExpr(), Then: p.parseBlock()}
+	s := &IfStmt{Pos: t.Pos, Cond: p.parseCond(), Then: p.parseBlock()}
 	if p.at(KwElse) {
 		p.next()
 		if p.at(KwIf) {
@@ -281,17 +357,23 @@ func (p *parser) parseIf() Stmt {
 	return s
 }
 
-func (p *parser) parseArgs() []Expr {
-	var args []Expr
-	for !p.at(RParen) {
-		args = append(args, p.parseExpr())
-		if !p.at(Comma) {
-			break
+func (p *parser) parseList(end Kind, context string) []Expr {
+	var list []Expr
+	p.withStructLits(func() {
+		for !p.at(end) {
+			list = append(list, p.parseExpr())
+			if !p.at(Comma) {
+				break
+			}
+			p.next()
 		}
-		p.next()
-	}
-	p.expect(RParen, "to close argument list")
-	return args
+		p.expect(end, context)
+	})
+	return list
+}
+
+func (p *parser) parseArgs() []Expr {
+	return p.parseList(RParen, "to close argument list")
 }
 
 var binaryPrec = map[Kind]int{
@@ -348,13 +430,17 @@ func (p *parser) parsePostfix() Expr {
 	for {
 		switch p.tok().Kind {
 		case Dot:
-			dot := p.next()
-			id, ok := x.(*Ident)
-			if !ok {
-				p.fail(dot.Pos, "\".\" may only follow a module name")
-			}
+			p.next()
 			name := p.expectIdent("after \".\"")
-			x = &SelectorExpr{Pos: id.Pos, X: id, Name: name.Text}
+			x = &SelectorExpr{X: x, Name: name.Text, NamePos: name.Pos}
+		case LBracket:
+			p.next()
+			var idx Expr
+			p.withStructLits(func() {
+				idx = p.parseExpr()
+				p.expect(RBracket, "to close index expression")
+			})
+			x = &IndexExpr{X: x, Index: idx}
 		case LParen:
 			lp := p.next()
 			switch x.(type) {
@@ -367,6 +453,24 @@ func (p *parser) parsePostfix() Expr {
 			return x
 		}
 	}
+}
+
+func (p *parser) parseStructLit(pos Pos, module, name string) Expr {
+	lit := &StructLit{Pos: pos, Module: module, Name: name}
+	p.expect(LBrace, "to open struct literal")
+	p.withStructLits(func() {
+		for !p.at(RBrace) {
+			fn := p.expectIdent("for field name in struct literal")
+			p.expect(Colon, "after field name")
+			lit.Fields = append(lit.Fields, &FieldInit{Pos: fn.Pos, Name: fn.Text, Value: p.parseExpr()})
+			if !p.at(Comma) {
+				break
+			}
+			p.next()
+		}
+		p.expect(RBrace, "to close struct literal")
+	})
+	return lit
 }
 
 func (p *parser) parsePrimary() Expr {
@@ -382,6 +486,13 @@ func (p *parser) parsePrimary() Expr {
 			p.fail(t.Pos, "invalid integer literal %s", t.Text)
 		}
 		return &IntLit{Pos: t.Pos, Text: t.Text, Value: v}
+	case FloatTok:
+		p.next()
+		v, err := strconv.ParseFloat(t.Text, 64)
+		if err != nil {
+			p.fail(t.Pos, "invalid float literal %s", t.Text)
+		}
+		return &FloatLit{Pos: t.Pos, Text: t.Text, Value: v}
 	case StringTok:
 		p.next()
 		return &StringLit{Pos: t.Pos, Value: t.Text}
@@ -390,12 +501,28 @@ func (p *parser) parsePrimary() Expr {
 		return &BoolLit{Pos: t.Pos, Value: t.Kind == KwTrue}
 	case IdentTok:
 		p.next()
+		if !p.noStruct {
+			if p.at(LBrace) {
+				return p.parseStructLit(t.Pos, "", t.Text)
+			}
+			if p.at(Dot) && p.peekKind(1) == IdentTok && p.peekKind(2) == LBrace {
+				p.next()
+				name := p.next()
+				return p.parseStructLit(t.Pos, t.Text, name.Text)
+			}
+		}
 		return &Ident{Pos: t.Pos, Name: t.Text}
 	case LParen:
 		p.next()
-		x := p.parseExpr()
-		p.expect(RParen, "to close parenthesized expression")
+		var x Expr
+		p.withStructLits(func() {
+			x = p.parseExpr()
+			p.expect(RParen, "to close parenthesized expression")
+		})
 		return x
+	case LBracket:
+		p.next()
+		return &ArrayLit{Pos: t.Pos, Elems: p.parseList(RBracket, "to close array literal")}
 	}
 	p.fail(t.Pos, "expected expression, found %s", t.describe())
 	return nil

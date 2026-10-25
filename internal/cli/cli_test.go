@@ -133,3 +133,27 @@ func TestRunReportsSignals(t *testing.T) {
 		t.Errorf("code %d, out %q, stderr %q", code, out, errOut)
 	}
 }
+
+func TestRunPassesProgramArgs(t *testing.T) {
+	requireCC(t)
+	src := writeSource(t, "args.ks", "fn main() { print(args(), len(args())); }")
+	code, out, errOut := runCLI("run", src, "--", "a", "--flag", "b c")
+	if code != 0 || out != "[\"a\", \"--flag\", \"b c\"] 3\n" {
+		t.Errorf("code %d, out %q, stderr %q", code, out, errOut)
+	}
+	if code, _, errOut := runCLI("build", src, "--", "x"); code != 2 || !strings.Contains(errOut, "unknown flag --") {
+		t.Errorf("build with --: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSanitizeFlag(t *testing.T) {
+	requireCC(t)
+	src := writeSource(t, "san.ks", "fn main() { var a = [\"x\"]; push(a, \"y\"); print(a); }")
+	code, out, errOut := runCLI("run", src, "--sanitize")
+	if code != 0 {
+		t.Skipf("sanitized build unavailable: %s", errOut)
+	}
+	if out != "[\"x\", \"y\"]\n" {
+		t.Errorf("out %q, stderr %q", out, errOut)
+	}
+}

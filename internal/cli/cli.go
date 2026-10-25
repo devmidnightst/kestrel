@@ -15,23 +15,25 @@ import (
 	"github.com/devmidnightst/kestrel/internal/compiler"
 )
 
-var Version = "0.1.0-dev"
+var Version = "0.2.0-dev"
 
 const maxReportedErrors = 50
 
 const usage = `usage:
-  kestrel build <file.ks> [-o output] [--emit-c file.c] [--cc compiler]
-  kestrel run <file.ks> [--cc compiler]
+  kestrel build <file.ks> [-o output] [--emit-c file.c] [--cc compiler] [--sanitize]
+  kestrel run <file.ks> [--cc compiler] [--sanitize] [-- program args...]
   kestrel check <file.ks>
   kestrel version
   kestrel help
 `
 
 type options struct {
-	file   string
-	output string
-	emitC  string
-	cc     string
+	file     string
+	output   string
+	emitC    string
+	cc       string
+	sanitize bool
+	progArgs []string
 }
 
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -71,7 +73,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				opts.output += ".exe"
 			}
 		}
-		err := compiler.Build(opts.file, compiler.BuildOptions{Output: opts.output, EmitC: opts.emitC, CC: opts.cc})
+		err := compiler.Build(opts.file, compiler.BuildOptions{Output: opts.output, EmitC: opts.emitC, CC: opts.cc, Sanitize: opts.sanitize})
 		if err != nil {
 			reportError(stderr, err)
 			return 1
@@ -92,11 +94,11 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	if err := compiler.Build(opts.file, compiler.BuildOptions{Output: exe, CC: opts.cc}); err != nil {
+	if err := compiler.Build(opts.file, compiler.BuildOptions{Output: exe, CC: opts.cc, Sanitize: opts.sanitize}); err != nil {
 		reportError(stderr, err)
 		return 1
 	}
-	cmd := exec.Command(exe)
+	cmd := exec.Command(exe, opts.progArgs...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -142,12 +144,17 @@ func parseOptions(cmd string, args []string) (options, error) {
 		}
 		var err error
 		switch {
+		case a == "--" && cmd == "run":
+			o.progArgs = append([]string{}, args[i+1:]...)
+			i = len(args)
 		case a == "-o" && cmd == "build":
 			o.output, err = value()
 		case (a == "--emit-c" || a == "-emit-c") && cmd == "build":
 			o.emitC, err = value()
 		case (a == "--cc" || a == "-cc") && cmd != "check":
 			o.cc, err = value()
+		case a == "--sanitize" && cmd != "check":
+			o.sanitize = true
 		case strings.HasPrefix(a, "-") && a != "-":
 			return o, fmt.Errorf("unknown flag %s", a)
 		default:

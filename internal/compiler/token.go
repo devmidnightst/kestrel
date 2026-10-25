@@ -9,6 +9,7 @@ const (
 	IdentTok
 	IntTok
 	StringTok
+	FloatTok
 
 	KwFn
 	KwPub
@@ -25,6 +26,7 @@ const (
 	KwAs
 	KwBreak
 	KwContinue
+	KwStruct
 
 	Plus
 	Minus
@@ -45,6 +47,8 @@ const (
 	RParen
 	LBrace
 	RBrace
+	LBracket
+	RBracket
 	Comma
 	Semicolon
 	Colon
@@ -56,6 +60,7 @@ var kindText = map[Kind]string{
 	EOF:        "end of file",
 	IdentTok:   "identifier",
 	IntTok:     "integer literal",
+	FloatTok:   "float literal",
 	StringTok:  "string literal",
 	KwFn:       "fn",
 	KwPub:      "pub",
@@ -72,6 +77,7 @@ var kindText = map[Kind]string{
 	KwAs:       "as",
 	KwBreak:    "break",
 	KwContinue: "continue",
+	KwStruct:   "struct",
 	Plus:       "+",
 	Minus:      "-",
 	Star:       "*",
@@ -91,6 +97,8 @@ var kindText = map[Kind]string{
 	RParen:     ")",
 	LBrace:     "{",
 	RBrace:     "}",
+	LBracket:   "[",
+	RBracket:   "]",
 	Comma:      ",",
 	Semicolon:  ";",
 	Colon:      ":",
@@ -114,6 +122,7 @@ var keywords = map[string]Kind{
 	"as":       KwAs,
 	"break":    KwBreak,
 	"continue": KwContinue,
+	"struct":   KwStruct,
 }
 
 func (k Kind) String() string {
@@ -135,6 +144,8 @@ func (t Token) describe() string {
 		return fmt.Sprintf("identifier %q", t.Text)
 	case IntTok:
 		return fmt.Sprintf("integer %s", t.Text)
+	case FloatTok:
+		return fmt.Sprintf("float %s", t.Text)
 	case StringTok:
 		return "string literal"
 	case EOF:
