@@ -89,7 +89,7 @@ func TestLexErrors(t *testing.T) {
 		{"let x = 1 # 2", "e.ks:1:11: error: unexpected character '#'"},
 		{"\n  a & b", "e.ks:2:5: error: unexpected character '&' (did you mean \"&&\"?)"},
 		{"let x = 12abc;", "e.ks:1:11: error: invalid character 'a' in integer literal"},
-		{"let x = 9223372036854775808;", "e.ks:1:9: error: integer literal 9223372036854775808 does not fit in a signed 64-bit int"},
+		{"let x = 9223372036854775809;", "e.ks:1:9: error: integer literal 9223372036854775809 does not fit in a signed 64-bit int"},
 		{"\xff", "e.ks:1:1: error: source file is not valid utf-8"},
 	}
 	for _, c := range cases {

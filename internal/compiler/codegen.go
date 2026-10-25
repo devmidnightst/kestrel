@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -57,6 +58,7 @@ func GenerateC(prog *Program) string {
 		}
 	}
 	g.sb.WriteString("\nint main(void) {\n")
+	g.sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
 	if prog.Main.Result == IntType {
 		fmt.Fprintf(&g.sb, "\tint64_t ks_rc = %s();\n\tfflush(stdout);\n\treturn (int)ks_rc;\n", prog.Main.CName)
 	} else {
@@ -238,6 +240,9 @@ func (g *gen) expr(e Expr) string {
 	info := g.prog.Info
 	switch e := e.(type) {
 	case *IntLit:
+		if e.Value == math.MinInt64 {
+			return "INT64_MIN"
+		}
 		return fmt.Sprintf("INT64_C(%d)", e.Value)
 	case *StringLit:
 		return cString(e.Value)

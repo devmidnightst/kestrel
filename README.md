@@ -4,8 +4,10 @@ kestrel is a small, statically typed toy programming language. the compiler is
 written in go (standard library only), translates kestrel to c, and calls an
 installed c compiler (cc, gcc or clang) to produce a native executable.
 
-this is an mvp for learning and experimenting. it is not production ready and
-makes no performance promises.
+this is an early, experimental language. the compiler is tested (unit tests,
+fuzzing, randomly generated programs compiled and run in ci), but the language
+is missing things most real programs need (see below), so it is not production
+ready and makes no performance promises.
 
 ## requirements
 
@@ -27,8 +29,8 @@ kestrel check hello.ks            # parse and type check only
 kestrel build hello.ks --emit-c hello.c   # also keep the generated c
 ```
 
-`kestrel run` exits with the program's exit status. compile errors look like
-`hello.ks:3:5: error: undefined: x`.
+`kestrel run` exits with the program's exit status (128 + signal number if it was
+killed by a signal). compile errors look like `hello.ks:3:5: error: undefined: x`.
 
 ## a taste
 
@@ -103,7 +105,11 @@ go vet ./...
 go test ./...
 ```
 
-tests that compile native code are skipped when no c compiler is found.
+tests that compile native code are skipped when no c compiler is found. ci
+runs formatting, vet, tests, fuzzing and randomly generated programs on linux
+(gcc and clang) and macos (clang). windows is untested. fuzzing, stress
+testing and release builds are described in
+[docs/development.md](docs/development.md).
 
 ## layout
 

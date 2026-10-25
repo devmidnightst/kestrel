@@ -1,10 +1,29 @@
 package compiler
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
+
+const minIntMagnitude = "9223372036854775808"
+
+const maxNesting = 256
 
 type parser struct {
-	toks []Token
-	pos  int
+	toks  []Token
+	pos   int
+	depth int
+}
+
+func (p *parser) enter() {
+	p.depth++
+	if p.depth > maxNesting {
+		p.fail(p.tok().Pos, "nesting too deep (more than %d levels)", maxNesting)
+	}
+}
+
+func (p *parser) leave() {
+	p.depth--
 }
 
 type parseBailout struct {
@@ -167,6 +186,8 @@ func (p *parser) parseType() *TypeExpr {
 }
 
 func (p *parser) parseBlock() *Block {
+	p.enter()
+	defer p.leave()
 	lb := p.expect(LBrace, "to open block")
 	b := &Block{Pos: lb.Pos}
 	for !p.at(RBrace) {
@@ -245,6 +266,8 @@ func (p *parser) parseStmt() Stmt {
 }
 
 func (p *parser) parseIf() Stmt {
+	p.enter()
+	defer p.leave()
 	t := p.expect(KwIf, "")
 	s := &IfStmt{Pos: t.Pos, Cond: p.parseExpr(), Then: p.parseBlock()}
 	if p.at(KwElse) {
@@ -306,9 +329,15 @@ func (p *parser) parseBinary(minPrec int) Expr {
 }
 
 func (p *parser) parseUnary() Expr {
+	p.enter()
+	defer p.leave()
 	t := p.tok()
 	if t.Kind == Minus || t.Kind == Bang {
 		p.next()
+		if lit := p.tok(); t.Kind == Minus && lit.Kind == IntTok && lit.Text == minIntMagnitude {
+			p.next()
+			return &IntLit{Pos: t.Pos, Text: "-" + lit.Text, Value: math.MinInt64}
+		}
 		return &UnaryExpr{Pos: t.Pos, Op: t.Kind, X: p.parseUnary()}
 	}
 	return p.parsePostfix()
@@ -345,6 +374,9 @@ func (p *parser) parsePrimary() Expr {
 	switch t.Kind {
 	case IntTok:
 		p.next()
+		if t.Text == minIntMagnitude {
+			p.fail(t.Pos, "integer literal %s does not fit in a signed 64-bit int (only -%s is allowed)", t.Text, t.Text)
+		}
 		v, err := strconv.ParseInt(t.Text, 10, 64)
 		if err != nil {
 			p.fail(t.Pos, "invalid integer literal %s", t.Text)

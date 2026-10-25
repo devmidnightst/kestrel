@@ -12,16 +12,19 @@ experimental MVP: it is not production ready and makes no performance promises.
 - Diagnostics have the form `file.ks:LINE:COL: error: message`. Columns count
   Unicode code points, starting at 1.
 - The lexer and parser stop at the first syntax error. The type checker reports
-  every type error it finds, sorted by position.
+  every type error it finds, sorted by position. The `kestrel` command prints at most
+  50 errors.
+- Limits: a source file may be at most 8 MiB, and blocks, `if`/`else if`
+  chains and expressions may nest at most 256 levels deep.
 
 ## Lexical elements
 
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*` (ASCII only).
 - Keywords: `fn pub let var if else while return print true false import as
   break continue`.
-- Integer literals: decimal digits only, `0` to `9223372036854775807`. There is
-  no negative literal; `-5` is unary minus applied to `5`. The minimum value
-  must be written as `-9223372036854775807 - 1`.
+- Integer literals: decimal digits only, `0` to `9223372036854775807`. `-5` is
+  unary minus applied to `5`. As a special case, `-9223372036854775808` is
+  accepted when the minus sign directly precedes the literal.
 - String literals: double quoted, single line. Escapes: `\n \t \r \\ \"`.
   Raw control characters (other than tab) and NUL are rejected.
 - Operators and punctuation: `+ - * / % = == != < <= > >= && || ! ( ) { } , ; : -> .`
@@ -91,6 +94,8 @@ statement = ("let" | "var") IDENT [ ":" type ] "=" expr ";"
 - Only function calls may be used as expression statements.
 - `print` writes its arguments separated by single spaces, followed by a
   newline, to standard output. It accepts `int`, `bool`, and `string` values.
+  Standard output is line buffered, so completed lines are not lost if the
+  program later crashes.
 
 ## Expressions
 
@@ -114,6 +119,10 @@ Precedence, from lowest to highest (all binary operators are left associative):
   remainder by zero aborts the program.
 - Runtime errors print `kestrel: runtime error: <reason>` to standard error,
   flush standard output first, and exit with status 101.
+- There is no stack overflow detection. Unbounded recursion usually ends with
+  the operating system killing the program (for example `SIGSEGV`).
+  `kestrel run` reports a program killed by a signal and exits with status
+  128 + signal number.
 
 ### Builtin functions
 

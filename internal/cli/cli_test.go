@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/devmidnightst/kestrel/internal/compiler"
@@ -109,5 +111,25 @@ func TestBuildWithMissingCompiler(t *testing.T) {
 	code, _, errOut := runCLI("build", src, "-o", filepath.Join(t.TempDir(), "x"), "--cc", "definitely-not-a-c-compiler")
 	if code != 1 || !strings.Contains(errOut, "c compiler \"definitely-not-a-c-compiler\" not found") {
 		t.Errorf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestErrorCap(t *testing.T) {
+	src := "fn main() {\n" + strings.Repeat("  print(undefined_name);\n", 60) + "}\n"
+	code, _, errOut := runCLI("check", writeSource(t, "many.ks", src))
+	if code != 1 || strings.Count(errOut, "error: undefined") != maxReportedErrors || !strings.Contains(errOut, "too many errors; 10 more not shown") {
+		t.Errorf("code %d, stderr tail %q", code, errOut[len(errOut)-80:])
+	}
+}
+
+func TestRunReportsSignals(t *testing.T) {
+	requireCC(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("signals are unix only")
+	}
+	src := writeSource(t, "abort.ks", "import c \"stdlib.h\" { fn abort(); }\nfn main() { print(\"before\"); abort(); }")
+	code, out, errOut := runCLI("run", src)
+	if code != 128+int(syscall.SIGABRT) || out != "before\n" || !strings.Contains(errOut, "killed by signal") {
+		t.Errorf("code %d, out %q, stderr %q", code, out, errOut)
 	}
 }

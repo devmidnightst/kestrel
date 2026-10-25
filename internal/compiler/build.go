@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,12 +68,13 @@ func CompileC(src, output, ccOverride string) error {
 	if err != nil {
 		return err
 	}
+	built := filepath.Join(dir, "program.out")
 	args := append(cc[1:],
 		"-std=c11", "-O2",
 		"-Werror=implicit-function-declaration",
 		"-Werror=int-conversion",
 		"-Werror=incompatible-pointer-types",
-		"-o", out, cfile, "-lm")
+		"-o", built, cfile, "-lm")
 	cmd := exec.Command(cc[0], args...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -80,5 +82,33 @@ func CompileC(src, output, ccOverride string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("c compiler %s failed: %v\n%s", cc[0], err, strings.TrimSpace(buf.String()))
 	}
-	return nil
+	return install(built, out)
+}
+
+func install(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }

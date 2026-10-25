@@ -6,13 +6,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/devmidnightst/kestrel/internal/compiler"
 )
 
-const Version = "0.1.0"
+var Version = "0.1.0-dev"
+
+const maxReportedErrors = 50
 
 const usage = `usage:
   kestrel build <file.ks> [-o output] [--emit-c file.c] [--cc compiler]
@@ -62,6 +67,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "build":
 		if opts.output == "" {
 			opts.output = strings.TrimSuffix(filepath.Base(opts.file), ".ks")
+			if runtime.GOOS == "windows" {
+				opts.output += ".exe"
+			}
 		}
 		err := compiler.Build(opts.file, compiler.BuildOptions{Output: opts.output, EmitC: opts.emitC, CC: opts.cc})
 		if err != nil {
@@ -81,6 +89,9 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	defer os.RemoveAll(dir)
 	exe := filepath.Join(dir, "program")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
 	if err := compiler.Build(opts.file, compiler.BuildOptions{Output: exe, CC: opts.cc}); err != nil {
 		reportError(stderr, err)
 		return 1
@@ -89,19 +100,33 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			if code := exit.ExitCode(); code >= 0 {
-				return code
-			}
-			fmt.Fprintf(stderr, "kestrel: program terminated: %v\n", err)
-			return 1
-		}
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	err = cmd.Run()
+	if err == nil {
+		return 0
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
 		fmt.Fprintf(stderr, "kestrel: %v\n", err)
 		return 1
 	}
-	return 0
+	if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		sig := status.Signal()
+		if sig != syscall.SIGINT {
+			fmt.Fprintf(stderr, "kestrel: program killed by signal: %v%s\n", sig, signalHint(sig))
+		}
+		return 128 + int(sig)
+	}
+	return exit.ExitCode()
+}
+
+func signalHint(sig syscall.Signal) string {
+	if sig == syscall.SIGSEGV {
+		return " (often a stack overflow from deep recursion)"
+	}
+	return ""
 }
 
 func parseOptions(cmd string, args []string) (options, error) {
@@ -144,8 +169,15 @@ func parseOptions(cmd string, args []string) (options, error) {
 func reportError(w io.Writer, err error) {
 	var list compiler.ErrorList
 	if errors.As(err, &list) {
-		for _, e := range list {
+		shown := list
+		if len(shown) > maxReportedErrors {
+			shown = shown[:maxReportedErrors]
+		}
+		for _, e := range shown {
 			fmt.Fprintln(w, e.Error())
+		}
+		if len(list) > len(shown) {
+			fmt.Fprintf(w, "too many errors; %d more not shown\n", len(list)-len(shown))
 		}
 		if len(list) > 1 {
 			fmt.Fprintf(w, "%d errors\n", len(list))

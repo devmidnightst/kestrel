@@ -167,3 +167,48 @@ func TestExamples(t *testing.T) {
 		})
 	}
 }
+
+func TestDeterministicOutput(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"main.ks":  "import \"b.ks\";\nimport \"a.ks\";\nimport c \"stdlib.h\" { fn llabs(n: int) -> int; }\nimport c \"stdio.h\" { fn getchar() -> int; }\nfn main() { a.f(); b.g(); print(llabs(-1)); }",
+		"a.ks":     "import c \"stdlib.h\" { fn llabs(n: int) -> int; }\npub fn f() { print(llabs(-2)); }",
+		"b.ks":     "pub fn g() { let x = 1; { let x = 2; print(x); } }",
+		"other.ks": "fn main() {}",
+	})
+	var first string
+	for i := 0; i < 5; i++ {
+		prog, err := Load(filepath.Join(dir, "main.ks"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := GenerateC(prog)
+		if i == 0 {
+			first = src
+		} else if src != first {
+			t.Fatal("generated c differs between runs")
+		}
+	}
+}
+
+func TestMinIntNative(t *testing.T) {
+	requireCC(t)
+	out, errOut, code := runSource(t, "fn main() { let m = -9223372036854775808; print(m, m + 1, m == -9223372036854775807 - 1); }")
+	if code != 0 || out != "-9223372036854775808 -9223372036854775807 true\n" {
+		t.Errorf("exit %d, out %q, stderr %q", code, out, errOut)
+	}
+}
+
+func TestFailedBuildKeepsExistingOutput(t *testing.T) {
+	requireCC(t)
+	dir := writeFiles(t, map[string]string{
+		"main.ks": "import c \"stdlib.h\" { fn no_such_function_here() -> int; }\nfn main() { print(no_such_function_here()); }",
+		"prog":    "previous",
+	})
+	if err := Build(filepath.Join(dir, "main.ks"), BuildOptions{Output: filepath.Join(dir, "prog")}); err == nil {
+		t.Fatal("expected build failure")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "prog"))
+	if err != nil || string(data) != "previous" {
+		t.Errorf("existing output was clobbered: %q, %v", data, err)
+	}
+}

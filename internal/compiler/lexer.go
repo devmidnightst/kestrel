@@ -6,6 +6,8 @@ import (
 	"unicode/utf8"
 )
 
+const MaxSourceSize = 8 << 20
+
 type lexer struct {
 	file string
 	src  []rune
@@ -15,6 +17,9 @@ type lexer struct {
 }
 
 func Lex(file string, src []byte) ([]Token, error) {
+	if len(src) > MaxSourceSize {
+		return nil, errorf(Pos{File: file, Line: 1, Col: 1}, "source file is larger than %d bytes", MaxSourceSize)
+	}
 	if !utf8.Valid(src) {
 		return nil, errorf(Pos{File: file, Line: 1, Col: 1}, "source file is not valid utf-8")
 	}
@@ -140,7 +145,7 @@ func (lx *lexer) next() (Token, error) {
 			return Token{}, errorf(lx.pos(), "invalid character %q in integer literal", lx.peek(0))
 		}
 		text := string(lx.src[begin:lx.off])
-		if _, err := strconv.ParseInt(text, 10, 64); err != nil {
+		if v, err := strconv.ParseUint(text, 10, 64); err != nil || v > 1<<63 {
 			return Token{}, errorf(start, "integer literal %s does not fit in a signed 64-bit int", text)
 		}
 		return Token{Kind: IntTok, Text: text, Pos: start}, nil

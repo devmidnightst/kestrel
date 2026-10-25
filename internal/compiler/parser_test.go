@@ -176,3 +176,38 @@ func TestParseErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestNestingLimit(t *testing.T) {
+	deepExpr := "fn main() { let v = " + strings.Repeat("(", 300) + "1" + strings.Repeat(")", 300) + "; }"
+	deepBlock := "fn main() " + strings.Repeat("{ ", 300) + strings.Repeat("} ", 300)
+	deepUnary := "fn main() { let v = " + strings.Repeat("-", 300) + "1; }"
+	for _, src := range []string{deepExpr, deepBlock, deepUnary} {
+		_, err := Parse("d.ks", []byte(src))
+		if err == nil || !strings.Contains(err.Error(), "nesting too deep") {
+			t.Errorf("expected nesting error, got %v", err)
+		}
+	}
+	ok := "fn main() { let v = " + strings.Repeat("(", 100) + "1" + strings.Repeat(")", 100) + "; }"
+	if _, err := Parse("d.ks", []byte(ok)); err != nil {
+		t.Errorf("moderate nesting rejected: %v", err)
+	}
+}
+
+func TestMinIntLiteral(t *testing.T) {
+	e := parseExprForTest(t, "-9223372036854775808")
+	lit, ok := e.(*IntLit)
+	if !ok || lit.Value != -9223372036854775807-1 {
+		t.Fatalf("got %#v", e)
+	}
+	_, err := Parse("m.ks", []byte("fn main() { let v = 9223372036854775808; }"))
+	if err == nil || !strings.Contains(err.Error(), "only -9223372036854775808 is allowed") {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestSourceSizeLimit(t *testing.T) {
+	_, err := Lex("big.ks", make([]byte, MaxSourceSize+1))
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("got %v", err)
+	}
+}
