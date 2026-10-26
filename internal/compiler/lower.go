@@ -1,0 +1,503 @@
+package compiler
+
+import (
+	"fmt"
+	"strings"
+)
+
+type genScope struct {
+	vars []string
+	loop bool
+}
+
+type fnGen struct {
+	g      *gen
+	out    *strings.Builder
+	ind    int
+	ntmp   int
+	scopes []*genScope
+	frames [][]string
+}
+
+func (f *fnGen) line(format string, args ...any) {
+	f.out.WriteString(strings.Repeat("\t", f.ind))
+	fmt.Fprintf(f.out, format, args...)
+	f.out.WriteString("\n")
+}
+
+func (f *fnGen) temp(ctype, init string) string {
+	f.ntmp++
+	name := fmt.Sprintf("ks_t%d", f.ntmp)
+	f.line("%s %s = %s;", ctype, name, init)
+	return name
+}
+
+func (f *fnGen) pushFrame() {
+	f.frames = append(f.frames, nil)
+}
+
+func (f *fnGen) popFrame() {
+	top := f.frames[len(f.frames)-1]
+	for i := len(top) - 1; i >= 0; i-- {
+		f.line("ks_release(%s);", top[i])
+	}
+	f.frames = f.frames[:len(f.frames)-1]
+}
+
+func (f *fnGen) releaseLater(name string) {
+	f.frames[len(f.frames)-1] = append(f.frames[len(f.frames)-1], name)
+}
+
+func (f *fnGen) releaseScope(s *genScope) {
+	for i := len(s.vars) - 1; i >= 0; i-- {
+		f.line("ks_release(%s);", s.vars[i])
+	}
+}
+
+func (f *fnGen) function(fn *Func) {
+	fmt.Fprintf(f.out, "\nstatic %s {\n", prototype(fn))
+	f.ind = 1
+	f.line("ks_stack_check();")
+	for _, p := range fn.Params {
+		f.line("(void)%s;", p.CName)
+	}
+	f.block(fn.Decl.Body, false)
+	if fn.Result != Void {
+		f.line("ks_panic(\"missing return\");")
+	}
+	f.ind = 0
+	f.out.WriteString("}\n")
+}
+
+func (f *fnGen) block(b *Block, loop bool) {
+	s := &genScope{loop: loop}
+	f.scopes = append(f.scopes, s)
+	for _, st := range b.Stmts {
+		f.stmt(st)
+	}
+	f.releaseScope(s)
+	f.scopes = f.scopes[:len(f.scopes)-1]
+}
+
+func (f *fnGen) open() {
+	f.line("{")
+	f.ind++
+	f.pushFrame()
+}
+
+func (f *fnGen) close() {
+	f.popFrame()
+	f.ind--
+	f.line("}")
+}
+
+func (f *fnGen) stmt(s Stmt) {
+	info := f.g.info
+	switch s := s.(type) {
+	case *LetStmt:
+		v := info.Defs[s]
+		f.line("%s %s = %s;", cType(v.Type), v.CName, zeroValue(v.Type))
+		f.open()
+		f.line("%s = %s;", v.CName, f.evalOwned(s.Value))
+		f.close()
+		if v.Type.Managed() {
+			sc := f.scopes[len(f.scopes)-1]
+			sc.vars = append(sc.vars, v.CName)
+		}
+	case *AssignStmt:
+		f.open()
+		f.assign(s)
+		f.close()
+	case *ExprStmt:
+		f.open()
+		x, owned := f.evalRaw(s.X)
+		if t := info.Types[s.X]; owned && t.Managed() {
+			f.releaseLater(x)
+		} else if x != "" && t != Void {
+			f.line("(void)%s;", x)
+		}
+		f.close()
+	case *PrintStmt:
+		f.open()
+		for i, a := range s.Args {
+			x := f.eval(a)
+			if i > 0 {
+				f.line("putchar(' ');")
+			}
+			f.line("%s", f.g.printValue(info.Types[a], x, false))
+		}
+		f.line("putchar('\\n');")
+		f.close()
+	case *IfStmt:
+		f.line("{")
+		f.ind++
+		cond := f.condition(s.Cond)
+		f.line("if (%s) {", cond)
+		f.ind++
+		f.block(s.Then, false)
+		f.ind--
+		if s.Else != nil {
+			f.line("} else {")
+			f.ind++
+			if b, ok := s.Else.(*BlockStmt); ok {
+				f.block(b.Block, false)
+			} else {
+				f.stmt(s.Else)
+			}
+			f.ind--
+		}
+		f.line("}")
+		f.ind--
+		f.line("}")
+	case *WhileStmt:
+		f.line("while (1) {")
+		f.ind++
+		cond := f.condition(s.Cond)
+		f.line("if (!%s) break;", cond)
+		f.block(s.Body, true)
+		f.ind--
+		f.line("}")
+	case *ReturnStmt:
+		f.open()
+		if s.Value == nil {
+			f.popFrame()
+			f.releaseAll(0)
+			f.line("return;")
+			f.pushFrame()
+		} else {
+			t := info.Types[s.Value]
+			r := f.temp(cType(t), f.evalOwned(s.Value))
+			f.popFrame()
+			f.releaseAll(0)
+			f.line("return %s;", r)
+			f.pushFrame()
+		}
+		f.close()
+	case *BreakStmt:
+		f.releaseToLoop()
+		f.line("break;")
+	case *ContinueStmt:
+		f.releaseToLoop()
+		f.line("continue;")
+	case *BlockStmt:
+		f.line("{")
+		f.ind++
+		f.block(s.Block, false)
+		f.ind--
+		f.line("}")
+	default:
+		panic(fmt.Sprintf("unexpected statement %T", s))
+	}
+}
+
+func (f *fnGen) condition(e Expr) string {
+	f.pushFrame()
+	c := f.eval(e)
+	cv := f.temp("bool", c)
+	f.popFrame()
+	return cv
+}
+
+func (f *fnGen) releaseAll(from int) {
+	for i := len(f.scopes) - 1; i >= from; i-- {
+		f.releaseScope(f.scopes[i])
+	}
+}
+
+func (f *fnGen) releaseToLoop() {
+	for i := len(f.scopes) - 1; i >= 0; i-- {
+		f.releaseScope(f.scopes[i])
+		if f.scopes[i].loop {
+			return
+		}
+	}
+}
+
+func (f *fnGen) eval(e Expr) string {
+	x, owned := f.evalRaw(e)
+	if owned && f.g.info.Types[e].Managed() {
+		f.releaseLater(x)
+	}
+	return x
+}
+
+func (f *fnGen) evalOwned(e Expr) string {
+	x, owned := f.evalRaw(e)
+	if !owned && f.g.info.Types[e].Managed() {
+		return fmt.Sprintf("ks_retain(%s)", x)
+	}
+	return x
+}
+
+func (f *fnGen) evalOwnedTemp(e Expr) string {
+	t := f.g.info.Types[e]
+	return f.temp(cType(t), f.evalOwned(e))
+}
+
+var checkedOps = map[Kind]string{
+	Plus:    "ks_add",
+	Minus:   "ks_sub",
+	Star:    "ks_mul",
+	Slash:   "ks_div",
+	Percent: "ks_mod",
+}
+
+var cOps = map[Kind]string{
+	Plus:      "+",
+	Minus:     "-",
+	Star:      "*",
+	Slash:     "/",
+	Less:      "<",
+	LessEq:    "<=",
+	Greater:   ">",
+	GreaterEq: ">=",
+	Eq:        "==",
+	NotEq:     "!=",
+}
+
+func (f *fnGen) evalRaw(e Expr) (string, bool) {
+	info := f.g.info
+	t := info.Types[e]
+	switch e := e.(type) {
+	case *IntLit:
+		return intLiteral(e.Value), false
+	case *FloatLit:
+		return floatLiteral(e.Value), false
+	case *BoolLit:
+		if e.Value {
+			return "true", false
+		}
+		return "false", false
+	case *StringLit:
+		return "(&" + f.g.literal(e.Value) + ".h)", false
+	case *Ident:
+		return info.Uses[e].CName, false
+	case *UnaryExpr:
+		x := f.eval(e.X)
+		switch {
+		case e.Op == Bang:
+			return f.temp("bool", "!"+x), false
+		case t == IntType:
+			return f.temp("int64_t", fmt.Sprintf("ks_neg(%s)", x)), false
+		}
+		return f.temp("double", "-"+x), false
+	case *BinaryExpr:
+		return f.binary(e, t)
+	case *IndexExpr:
+		a := f.eval(e.X)
+		i := f.eval(e.Index)
+		return f.temp(cType(t), fmt.Sprintf("ks_arr_%s_get(%s, %s)", arrKind(t), a, i)), false
+	case *SelectorExpr:
+		s := f.eval(e.X)
+		si := info.Types[e.X].Struct
+		return f.temp(cType(t), fmt.Sprintf("((%s *)%s)->f_%s", si.CName, s, e.Name)), false
+	case *ArrayLit:
+		k := arrKind(t.Elem)
+		arr := f.temp("ks_obj *", fmt.Sprintf("ks_arr_%s_new(%d)", k, len(e.Elems)))
+		for _, el := range e.Elems {
+			v := f.evalOwnedTemp(el)
+			f.line("ks_arr_%s_push(%s, %s);", k, arr, v)
+		}
+		return arr, true
+	case *StructLit:
+		si := info.Literals[e]
+		vals := map[string]string{}
+		for _, fi := range e.Fields {
+			vals[fi.Name] = f.evalOwnedTemp(fi.Value)
+		}
+		args := make([]string, len(si.Fields))
+		for i, fd := range si.Fields {
+			args[i] = vals[fd.Name]
+		}
+		return f.temp("ks_obj *", fmt.Sprintf("%s_new(%s)", si.CName, strings.Join(args, ", "))), true
+	case *CallExpr:
+		if name, ok := info.Builtins[e]; ok {
+			return f.builtin(e, name, t)
+		}
+		fn := info.Calls[e]
+		args := make([]string, len(e.Args))
+		for i, a := range e.Args {
+			args[i] = f.eval(a)
+		}
+		name := fn.CName
+		if fn.Extern {
+			name = externCName(fn)
+		}
+		call := fmt.Sprintf("%s(%s)", name, strings.Join(args, ", "))
+		if fn.Result == Void {
+			f.line("%s;", call)
+			return "", false
+		}
+		return f.temp(cType(fn.Result), call), fn.Result.Managed()
+	}
+	panic(fmt.Sprintf("unexpected expression %T", e))
+}
+
+func (f *fnGen) binary(e *BinaryExpr, t Type) (string, bool) {
+	if e.Op == AndAnd || e.Op == OrOr {
+		l := f.eval(e.X)
+		r := f.temp("bool", l)
+		if e.Op == AndAnd {
+			f.line("if (%s) {", r)
+		} else {
+			f.line("if (!%s) {", r)
+		}
+		f.ind++
+		f.pushFrame()
+		y := f.eval(e.Y)
+		f.line("%s = %s;", r, y)
+		f.popFrame()
+		f.ind--
+		f.line("}")
+		return r, false
+	}
+	operand := f.g.info.Types[e.X]
+	x := f.eval(e.X)
+	y := f.eval(e.Y)
+	switch operand.Kind {
+	case KString:
+		switch e.Op {
+		case Plus:
+			return f.temp("ks_obj *", fmt.Sprintf("ks_str_concat(%s, %s)", x, y)), true
+		case Eq:
+			return f.temp("bool", fmt.Sprintf("ks_str_eq(%s, %s)", x, y)), false
+		case NotEq:
+			return f.temp("bool", fmt.Sprintf("!ks_str_eq(%s, %s)", x, y)), false
+		}
+		return f.temp("bool", fmt.Sprintf("ks_str_cmp(%s, %s) %s 0", x, y, cOps[e.Op])), false
+	case KInt:
+		if fn, ok := checkedOps[e.Op]; ok {
+			return f.temp("int64_t", fmt.Sprintf("%s(%s, %s)", fn, x, y)), false
+		}
+	}
+	return f.temp(cType(t), fmt.Sprintf("%s %s %s", x, cOps[e.Op], y)), false
+}
+
+type placeStep struct {
+	expr Expr
+	idx  string
+}
+
+func (f *fnGen) prepPlace(target Expr) (*Var, []placeStep) {
+	var steps []placeStep
+	cur := target
+	for {
+		switch e := cur.(type) {
+		case *Ident:
+			for i, j := 0, len(steps)-1; i < j; i, j = i+1, j-1 {
+				steps[i], steps[j] = steps[j], steps[i]
+			}
+			for i := range steps {
+				if ix, ok := steps[i].expr.(*IndexExpr); ok {
+					steps[i].idx = f.temp("int64_t", f.eval(ix.Index))
+				}
+			}
+			return f.g.info.Uses[e], steps
+		case *IndexExpr:
+			steps = append(steps, placeStep{expr: e})
+			cur = e.X
+		case *SelectorExpr:
+			steps = append(steps, placeStep{expr: e})
+			cur = e.X
+		default:
+			panic(fmt.Sprintf("unexpected place %T", cur))
+		}
+	}
+}
+
+func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
+	info := f.g.info
+	ptr := "&" + root.CName
+	for _, st := range steps {
+		switch e := st.expr.(type) {
+		case *IndexExpr:
+			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+			elem := info.Types[e]
+			ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_arr_%s_slot(%s, %s)", arrKind(elem), u, st.idx))
+		case *SelectorExpr:
+			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+			si := info.Types[e.X].Struct
+			ptr = f.temp(cType(info.Types[e])+"*", fmt.Sprintf("&((%s *)%s)->f_%s", si.CName, u, e.Name))
+		}
+	}
+	return ptr
+}
+
+func (f *fnGen) assign(s *AssignStmt) {
+	root, steps := f.prepPlace(s.Target)
+	t := f.g.info.Types[s.Target]
+	rv := f.evalOwnedTemp(s.Value)
+	ptr := f.walkPlace(root, steps)
+	if t.Managed() {
+		f.line("ks_release(*%s);", ptr)
+	}
+	f.line("*%s = %s;", ptr, rv)
+}
+
+func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
+	info := f.g.info
+	switch name {
+	case "push":
+		root, steps := f.prepPlace(e.Args[0])
+		arrT := info.Types[e.Args[0]]
+		v := f.evalOwnedTemp(e.Args[1])
+		ptr := f.walkPlace(root, steps)
+		f.line("ks_arr_%s_push(ks_unique(%s), %s);", arrKind(arrT.Elem), ptr, v)
+		return "", false
+	case "pop":
+		root, steps := f.prepPlace(e.Args[0])
+		ptr := f.walkPlace(root, steps)
+		return f.temp(cType(t), fmt.Sprintf("ks_arr_%s_pop(ks_unique(%s))", arrKind(t), ptr)), t.Managed()
+	case "fill":
+		v := f.evalOwnedTemp(e.Args[0])
+		n := f.eval(e.Args[1])
+		return f.temp("ks_obj *", fmt.Sprintf("ks_arr_%s_fill(%s, %s)", arrKind(t.Elem), v, n)), true
+	}
+	args := make([]string, len(e.Args))
+	for i, a := range e.Args {
+		args[i] = f.eval(a)
+	}
+	call := func(fn string) string {
+		return fmt.Sprintf("%s(%s)", fn, strings.Join(args, ", "))
+	}
+	var argT Type
+	if len(e.Args) > 0 {
+		argT = info.Types[e.Args[0]]
+	}
+	switch name {
+	case "len":
+		if argT == StringType {
+			return f.temp("int64_t", call("ks_str_len")), false
+		}
+		return f.temp("int64_t", call("ks_arr_"+arrKind(argT.Elem)+"_len")), false
+	case "str":
+		switch argT.Kind {
+		case KInt:
+			return f.temp("ks_obj *", call("ks_str_int")), true
+		case KFloat:
+			return f.temp("ks_obj *", call("ks_str_float")), true
+		case KBool:
+			return f.temp("ks_obj *", call("ks_str_bool")), true
+		}
+		return args[0], false
+	case "abs":
+		if t == IntType {
+			return f.temp("int64_t", call("ks_abs_i64")), false
+		}
+		return f.temp("double", call("fabs")), false
+	case "min", "max":
+		suffix := "_f64"
+		if t == IntType {
+			suffix = "_i64"
+		}
+		return f.temp(cType(t), call("ks_"+name+suffix)), false
+	case "slice":
+		return f.temp("ks_obj *", call("ks_arr_"+arrKind(t.Elem)+"_slice")), true
+	}
+	sig := fixedBuiltins[name]
+	if sig.result == Void {
+		f.line("%s;", call(sig.cname))
+		return "", false
+	}
+	return f.temp(cType(sig.result), call(sig.cname)), sig.result.Managed()
+}

@@ -1,1 +1,158 @@
 # kestrel
+
+kestrel is a small, statically typed programming language. the compiler is
+written in go (standard library only), translates kestrel to c, and calls an
+installed c compiler (cc, gcc or clang) to produce a native executable.
+
+kestrel is young. the compiler is tested hard (unit tests, fuzzing, and
+thousands of randomly generated programs compiled and run under address and
+undefined behavior sanitizers in ci), but nobody has run it in production yet,
+and it makes no performance promises. read the "what does not exist" section
+before betting anything on it.
+
+## requirements
+
+- go 1.22 or newer
+- gcc or clang on your path (as cc, gcc or clang)
+- linux or macos (windows is untested)
+
+## install
+
+```sh
+go build -o kestrel ./cmd/kestrel
+```
+
+## usage
+
+```sh
+kestrel build app.ks -o app          # compile to a native executable
+kestrel run app.ks -- a b c          # compile to a temp dir, run with arguments
+kestrel check app.ks                 # parse and type check only
+kestrel build app.ks --emit-c app.c  # also keep the generated c
+kestrel run app.ks --sanitize        # debug build with address and ub sanitizers
+```
+
+`kestrel run` exits with the program's exit status (128 + signal number if it
+was killed by a signal). compile errors look like
+`app.ks:3:5: error: undefined: x`.
+
+## a taste
+
+```
+struct item {
+    name: string,
+    qty: int,
+}
+
+fn total(items: [item]) -> int {
+    var sum = 0;
+    var i = 0;
+    while i < len(items) {
+        sum = sum + items[i].qty;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() {
+    var items: [item] = [];
+    push(items, item { name: "rope", qty: 3 });
+    push(items, item { name: "lamp", qty: 1 });
+    let before = items;
+    items[0].qty = 10;
+    print(total(before), total(items));
+    print(items[0]);
+}
+```
+
+prints `4 11` and `item { name: "rope", qty: 10 }`. `before` keeps its old
+contents: arrays and structs are values, not shared references.
+
+## what exists
+
+- types: `int` (signed 64-bit), `float` (64-bit), `bool`, `string`, arrays
+  `[t]`, and structs
+- `let` (immutable) and `var` (mutable) with lexical block scope
+- functions, recursion, `if` / `else if` / `else`, `while`, `break`,
+  `continue`, `return`, `print`
+- value semantics with automatic memory management: reference counting plus
+  copy-on-write. memory is freed as soon as it is unreachable, and since values
+  cannot form cycles, nothing leaks
+- safety checks that stop the program with a clear message and exit status
+  101: integer overflow, division by zero, out of range indexing, stack
+  overflow from deep recursion, bad conversions, failed `assert`
+- builtins for strings (`split`, `join`, `find`, `substr`, `trim`, `upper`,
+  ...), math (`sqrt`, `pow`, `abs`, `min`, `max`, ...), arrays (`push`, `pop`,
+  `fill`, `slice`, `len`), parsing (`parse_int`, `parse_float`), input
+  (`read_line`, `eof`, `args`), and files (`read_file`, `write_file`,
+  `file_exists`)
+- modules: `import "lib/x.ks";` with `pub fn` and `pub struct` exports. paths
+  are relative and cannot escape the entry file's directory (symlinks
+  included)
+- a narrow c header import for functions that take and return only `int`,
+  `bool` and `float`:
+
+  ```
+  import c "math.h" {
+      fn cbrt(x: float) -> float;
+  }
+  ```
+
+## what does not exist
+
+no generics, closures, methods, maps, enums, tuples, optional or error types,
+`for` loops, globals, concurrency, networking, or unicode-aware string
+functions (strings are bytes). arrays and structs cannot be compared with
+`==`. errors that a real program might want to recover from (a missing file,
+a bad number) either return a bool or stop the program; there is no way to
+catch them. the c import is not a general ffi: no strings, pointers, structs,
+callbacks, or extra libraries. there is no go package interop.
+
+copy-on-write has a cost model worth knowing: changing a value that is still
+shared copies it first, so a function that takes an array, changes it and
+returns it copies the whole array each call. changing a `var` in place
+(`push(xs, x)`, `xs[i] = v`) does not copy.
+
+[docs/spec.md](docs/spec.md) is the full and honest reference.
+
+## examples
+
+```sh
+kestrel run examples/variables.ks
+kestrel run examples/functions.ks
+kestrel run examples/branching.ks
+kestrel run examples/loops.ks
+kestrel run examples/arrays.ks
+kestrel run examples/structs.ks
+kestrel run examples/modules/main.ks
+kestrel run examples/cheader.ks
+printf 'the cat\nthe dog\n' | kestrel run examples/wordfreq.ks
+```
+
+## development
+
+```sh
+gofmt -l .
+go vet ./...
+go test ./...
+```
+
+tests that need a c compiler or sanitizers skip themselves when those are
+missing. ci runs formatting, vet, race-enabled tests, fuzzing, and randomly
+generated programs (plain and sanitized) on linux (gcc and clang) and macos
+(clang). details are in [docs/development.md](docs/development.md).
+
+## license
+
+no license file has been chosen yet. until one is added, the default copyright
+rules apply and others have no permission to use, copy or modify the code.
+
+## layout
+
+- `cmd/kestrel`: command line entry point
+- `internal/cli`: argument handling for build, run and check
+- `internal/compiler`: lexer, parser, type checker, module loader, c code
+  generator, c runtime and build driver
+- `examples`: sample programs
+- `docs/spec.md`: language specification
+- `docs/development.md`: testing, fuzzing and release builds
