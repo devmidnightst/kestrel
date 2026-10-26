@@ -144,8 +144,13 @@ generated programs (plain and sanitized) on linux (gcc and clang) and macos
 
 ## license
 
-no license file has been chosen yet. until one is added, the default copyright
-rules apply and others have no permission to use, copy or modify the code.
+kestrel is licensed under the apache license 2.0 with llvm exceptions (spdx:
+`apache-2.0 with llvm-exception`). the full text is in the license file at the
+repository root.
+
+the llvm exception means programs you compile with kestrel are yours: the
+runtime code kestrel embeds in your executable does not require you to include
+the license or any attribution when you distribute that executable.
 
 ## layout
 
