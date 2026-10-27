@@ -120,8 +120,7 @@ contents: arrays and structs are values, not shared references.
 
 no generics, closures, enums, tuples, optional or error types,
 globals, concurrency, TLS, or unicode-aware string
-functions (strings are bytes). `for` walks integer ranges and arrays; it does
-not walk maps. arrays and structs cannot be compared with
+functions (strings are bytes). arrays and structs cannot be compared with
 `==`. errors that a real program might want to recover from (a missing file,
 a bad number) either return a bool or stop the program; there is no way to
 catch them. TCP is blocking and single-connection: there is no HTTP library
@@ -146,6 +145,7 @@ kestrel run examples/loops.ks
 kestrel run examples/for.ks
 kestrel run examples/fmt.ks
 kestrel run examples/methods.ks
+kestrel run examples/maps.ks
 kestrel run examples/arrays.ks
 kestrel run examples/structs.ks
 kestrel run examples/modules/main.ks

@@ -250,6 +250,29 @@ fn main() {
 fn main() {
     print(first(["", "ab", "c"]));
 }`, "ab\n"},
+	{"map delete and for", `fn main() {
+    var m: {string: int} = {};
+    m["a"] = 1;
+    m["b"] = 2;
+    m["c"] = 3;
+    var copy = m;
+    let removed = delete(m, "b");
+    let again = delete(m, "b");
+    print(removed, again, has(copy, "b"), has(m, "b"), len(m));
+    m["b"] = 9;
+    var sum = 0;
+    var n = 0;
+    for k in m {
+        sum = sum + m[k];
+        n = n + 1;
+        delete(m, k);
+    }
+    print(sum, n, len(m), len(copy));
+    var nums = { 1: "one", 2: "two" };
+    var seen = 0;
+    for k in nums { seen = seen + k; }
+    print(seen);
+}`, "true false true false 2\n13 3 0 3\n3\n"},
 	{"methods", `struct item { name: string, qty: int }
 struct box { it: item }
 fn (self: item) cost(price: int) -> int { return self.qty * price; }

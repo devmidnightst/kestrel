@@ -53,7 +53,7 @@ var fixedBuiltins = map[string]builtinSig{
 var builtinNames = map[string]bool{
 	"len": true, "str": true, "abs": true, "min": true, "max": true,
 	"push": true, "pop": true, "fill": true, "slice": true,
-	"has": true, "keys": true, "values": true,
+	"has": true, "keys": true, "values": true, "delete": true,
 	"fmt": true,
 }
 
@@ -194,6 +194,30 @@ func (c *checker) builtin(e *CallExpr, name string) Type {
 			return Invalid
 		}
 		return t
+	case "delete":
+		if c.allowMut != e {
+			c.errorf(e.Pos, "delete changes its map argument, so it may only be used as a statement or as the whole value of a let, var or assignment")
+		}
+		if !argc(2) {
+			return BoolType
+		}
+		if !isPlace(e.Args[0]) {
+			c.valueExpr(e.Args[0])
+			c.errorf(e.Args[0].P(), "the first argument of delete must be a var, field or element")
+			c.valueExpr(e.Args[1])
+			return BoolType
+		}
+		t := c.place(e.Args[0], e.Args[0])
+		if t != Invalid && t.Kind != KMap {
+			c.errorf(e.Args[0].P(), "delete expects a map, not %s", t)
+			c.valueExpr(e.Args[1])
+			return BoolType
+		}
+		kt := c.exprWant(e.Args[1], mapKey(t))
+		if t != Invalid && kt != Invalid && kt != t.Key {
+			c.errorf(e.Args[1].P(), "map key must be %s, not %s", t.Key, kt)
+		}
+		return BoolType
 	case "has":
 		if !argc(2) {
 			return BoolType

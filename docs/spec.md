@@ -208,8 +208,11 @@ for x in items { }    // x is each element of an array
   of the array, so a later mutation copies instead of altering the walk.
 - The step after an inclusive end is not computed. `for i in max..=max`,
   where `max` is the largest int, runs once and does not overflow.
-- `for` does not walk maps or strings. Iterate `keys(m)` if you need the keys,
-  then index the map. Map iteration order would be hash order.
+- `for k in map` walks the keys, in the same order as `keys`. The map
+  expression is evaluated once and retained, so deleting from the original
+  `var` during the loop does not change which keys this loop visits. The
+  loop variable is the key. Use `m[k]` for the value. Strings are not
+  walked.
 - `break` leaves the loop. `continue` abandons the rest of the body and
   advances. A `while` nested inside `for` has its own `break` and `continue`.
 - A struct literal in the `for` header must be wrapped in parentheses, same
@@ -285,6 +288,7 @@ User functions may shadow builtin names.
 | `tcp_write(fd, data) -> int` | bytes written, or `-1` |
 | `tcp_close(fd)` | close a socket. A bad descriptor is ignored |
 | `fmt(format, ...)` | replace each `{}` in a string. `{{` and `}}` are literal braces. A string literal is checked at compile time for hole syntax and argument count; a computed format is checked at run time and stops the program on a mismatch. Values must be int, float, bool or string, rendered the same way as `print`. Arrays, maps and structs are rejected (use `print`) |
+| `delete(place, key) -> bool` | remove `key` from a map held in a `var`. true if it was present. a missing key is left alone. same statement rule as `push` |
 | `has(m, key) -> bool` | true if the map contains `key` |
 | `keys(m) -> [K]` | the map's keys, in hash order |
 | `values(m) -> [V]` | the map's values, in the same order as `keys` |
@@ -382,7 +386,7 @@ Windows is not.
 ## Not supported
 
 Generics, closures and first-class functions, interfaces, enums,
-tuples, optional or error types, exceptions, iteration over maps, compound
+tuples, optional or error types, exceptions, compound
 assignment (`+=`), global variables and constants, string indexing by
 character, Unicode-aware string operations, deep equality on arrays and
 structs, concurrency, TLS, directory operations, environment variables, Go

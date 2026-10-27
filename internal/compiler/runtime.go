@@ -1020,14 +1020,22 @@ KS_RT int64_t NAME_find(NAME *m, KEYC key, bool *found) {
 	uint64_t h = KEYHASH;
 	int64_t mask = m->cap - 1;
 	int64_t i = (int64_t)(h & (uint64_t)mask);
+	int64_t tomb = -1;
 	for (int64_t n = 0; n < m->cap; n++) {
-		if (m->used[i] == 0) { *found = false; return i; }
-		KEYC a = m->keys[i];
-		KEYC b = key;
-		if (KEYEQ) { *found = true; return i; }
+		uint8_t u = m->used[i];
+		if (u == 0) { *found = false; return tomb >= 0 ? tomb : i; }
+		if (u == 2) {
+			if (tomb < 0) tomb = i;
+		} else {
+			KEYC a = m->keys[i];
+			KEYC b = key;
+			if (KEYEQ) { *found = true; return i; }
+		}
 		i = (i + 1) & mask;
 	}
 	*found = false;
+	if (tomb >= 0) return tomb;
+	ks_panic("map too large");
 	return 0;
 }
 
@@ -1076,6 +1084,23 @@ KS_RT void NAME_set(ks_obj *o, KEYC key, VALC val) {
 	m->keys[i] = KEYRETAIN;
 	m->vals[i] = val;
 	m->len++;
+}
+
+KS_RT bool NAME_delete(ks_obj *o, KEYC key) {
+	NAME *m = (NAME *)o;
+	if (m->cap == 0) return false;
+	bool found = false;
+	int64_t i = NAME_find(m, key, &found);
+	if (!found) return false;
+	{
+		KEYC key = m->keys[i];
+		KEYRELEASE;
+		VALC v = m->vals[i];
+		VALRELEASE;
+	}
+	m->used[i] = 2;
+	m->len--;
+	return true;
 }
 
 KS_RT bool NAME_has(ks_obj *o, KEYC key) {

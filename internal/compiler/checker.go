@@ -486,11 +486,13 @@ func (c *checker) checkStmt(s Stmt) {
 			switch {
 			case seq == Invalid:
 				elem = Invalid
-			case seq.Kind != KArray:
-				c.errorf(s.Seq.P(), "for expects an array, not %s (ranges are for i in start..end)", seq)
-				elem = Invalid
-			default:
+			case seq.Kind == KArray:
 				elem = seq.Elem
+			case seq.Kind == KMap:
+				elem = seq.Key
+			default:
+				c.errorf(s.Seq.P(), "for expects an array or a map, not %s (ranges are for i in start..end)", seq)
+				elem = Invalid
 			}
 		}
 		c.push()

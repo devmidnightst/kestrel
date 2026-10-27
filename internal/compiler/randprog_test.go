@@ -400,17 +400,20 @@ func (g *randProg) stmt(depth int, result Type, loop bool) {
 	case 13:
 		name := g.fresh("i")
 		var elem Type
-		switch g.r.Intn(3) {
+		switch g.r.Intn(4) {
 		case 0:
 			g.line("for %s in ((%s) %% 3)..((%s) %% 3) {", name, g.expr(IntType, 2), g.expr(IntType, 2))
 			elem = IntType
 		case 1:
 			g.line("for %s in ((%s) %% 3)..=((%s) %% 3) {", name, g.expr(IntType, 2), g.expr(IntType, 2))
 			elem = IntType
-		default:
+		case 2:
 			arrT := []Type{randIntArr, randStrArr, randPairs}[g.r.Intn(3)]
 			g.line("for %s in %s {", name, g.boundedArray(arrT))
 			elem = arrT.Elem
+		default:
+			g.line("for %s in { %s: %d } {", name, g.stringLit(), g.r.Intn(4))
+			elem = StringType
 		}
 		g.scopes = append(g.scopes, nil)
 		g.declare(name, elem, false)
@@ -432,7 +435,12 @@ func (g *randProg) stmt(depth int, result Type, loop bool) {
 			g.declare(name, IntType, false)
 			return
 		}
-		g.line("print(0);")
+		mname := g.fresh("m")
+		dname := g.fresh("d")
+		g.line("var %s: {string: int} = {};", mname)
+		g.line("%s[%s] = %d;", mname, g.stringLit(), g.r.Intn(4))
+		g.line("let %s = delete(%s, %s);", dname, mname, g.stringLit())
+		g.declare(dname, BoolType, false)
 	}
 }
 

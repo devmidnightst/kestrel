@@ -237,6 +237,34 @@ func (f *fnGen) evalOwnedKept(e Expr) string {
 	return v
 }
 
+func (f *fnGen) forMap(s *ForStmt, outer *genScope, lab string) {
+	info := f.g.info
+	mp := f.evalOwnedKept(s.Seq)
+	outer.vars = append(outer.vars, mp)
+	mt := info.Types[s.Seq]
+	kind := mapKind(mt)
+	m := f.temp("ks_map_"+kind+" *", fmt.Sprintf("(ks_map_%s *)%s", kind, mp))
+	idx := f.temp("int64_t", "0")
+	f.line("while (1) {")
+	f.ind++
+	f.line("while (%s < %s->cap && %s->used[%s] != 1) %s++;", idx, m, m, idx, idx)
+	f.line("if (!(%s < %s->cap)) break;", idx, m)
+	f.blockGo(s.Body, true, lab, func(sc *genScope) {
+		v := info.Loops[s]
+		get := fmt.Sprintf("%s->keys[%s]", m, idx)
+		if v.Type.Managed() {
+			f.line("%s %s = ks_retain(%s);", cType(v.Type), v.CName, get)
+			sc.vars = append(sc.vars, v.CName)
+		} else {
+			f.line("%s %s = %s;", cType(v.Type), v.CName, get)
+		}
+	})
+	f.line("%s:", lab)
+	f.line("%s = ks_add(%s, 1);", idx, idx)
+	f.ind--
+	f.line("}")
+}
+
 func (f *fnGen) forStmt(s *ForStmt) {
 	info := f.g.info
 	f.line("{")
@@ -244,7 +272,9 @@ func (f *fnGen) forStmt(s *ForStmt) {
 	outer := &genScope{}
 	f.scopes = append(f.scopes, outer)
 	lab := f.label("ks_fc")
-	if s.Kind == ForArray {
+	if s.Kind == ForArray && info.Types[s.Seq].Kind == KMap {
+		f.forMap(s, outer, lab)
+	} else if s.Kind == ForArray {
 		arr := f.evalOwnedKept(s.Seq)
 		outer.vars = append(outer.vars, arr)
 		elem := info.Types[s.Seq].Elem
@@ -637,6 +667,13 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 	switch name {
 	case "fmt":
 		return f.fmtCall(e)
+	case "delete":
+		root, steps := f.prepPlace(e.Args[0])
+		key := f.eval(e.Args[1])
+		ptr := f.walkPlace(root, steps)
+		mt := info.Types[e.Args[0]]
+		u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+		return f.temp("bool", fmt.Sprintf("ks_map_%s_delete(%s, %s)", mapKind(mt), u, key)), false
 	case "push":
 		root, steps := f.prepPlace(e.Args[0])
 		arrT := info.Types[e.Args[0]]
