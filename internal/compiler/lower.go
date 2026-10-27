@@ -8,6 +8,7 @@ import (
 type genScope struct {
 	vars []string
 	loop bool
+	cont string
 }
 
 type fnGen struct {
@@ -70,8 +71,15 @@ func (f *fnGen) function(fn *Func) {
 }
 
 func (f *fnGen) block(b *Block, loop bool) {
-	s := &genScope{loop: loop}
+	f.blockGo(b, loop, "", nil)
+}
+
+func (f *fnGen) blockGo(b *Block, loop bool, cont string, init func(*genScope)) {
+	s := &genScope{loop: loop, cont: cont}
 	f.scopes = append(f.scopes, s)
+	if init != nil {
+		init(s)
+	}
 	for _, st := range b.Stmts {
 		f.stmt(st)
 	}
@@ -157,6 +165,8 @@ func (f *fnGen) stmt(s Stmt) {
 		f.block(s.Body, true)
 		f.ind--
 		f.line("}")
+	case *ForStmt:
+		f.forStmt(s)
 	case *ReturnStmt:
 		f.open()
 		if s.Value == nil {
@@ -178,7 +188,11 @@ func (f *fnGen) stmt(s Stmt) {
 		f.line("break;")
 	case *ContinueStmt:
 		f.releaseToLoop()
-		f.line("continue;")
+		if lab := f.continueLabel(); lab != "" {
+			f.line("goto %s;", lab)
+		} else {
+			f.line("continue;")
+		}
 	case *BlockStmt:
 		f.line("{")
 		f.ind++
@@ -188,6 +202,94 @@ func (f *fnGen) stmt(s Stmt) {
 	default:
 		panic(fmt.Sprintf("unexpected statement %T", s))
 	}
+}
+
+func (f *fnGen) continueLabel() string {
+	for i := len(f.scopes) - 1; i >= 0; i-- {
+		if f.scopes[i].loop {
+			return f.scopes[i].cont
+		}
+	}
+	return ""
+}
+
+func (f *fnGen) label(prefix string) string {
+	f.ntmp++
+	return fmt.Sprintf("%s%d", prefix, f.ntmp)
+}
+
+// evalKept evaluates e and keeps a scalar copy after temporary values are released.
+func (f *fnGen) evalKept(e Expr) string {
+	f.pushFrame()
+	v := f.temp(cType(f.g.info.Types[e]), f.eval(e))
+	f.popFrame()
+	return v
+}
+
+// evalOwnedKept evaluates e as an owned object that the caller releases.
+func (f *fnGen) evalOwnedKept(e Expr) string {
+	f.pushFrame()
+	v := f.temp("ks_obj *", f.evalOwned(e))
+	f.popFrame()
+	return v
+}
+
+func (f *fnGen) forStmt(s *ForStmt) {
+	info := f.g.info
+	f.line("{")
+	f.ind++
+	outer := &genScope{}
+	f.scopes = append(f.scopes, outer)
+	lab := f.label("ks_fc")
+	if s.Kind == ForArray {
+		arr := f.evalOwnedKept(s.Seq)
+		outer.vars = append(outer.vars, arr)
+		elem := info.Types[s.Seq].Elem
+		k := arrKind(elem)
+		n := f.temp("int64_t", fmt.Sprintf("ks_arr_%s_len(%s)", k, arr))
+		idx := f.temp("int64_t", "0")
+		f.line("while (1) {")
+		f.ind++
+		f.line("if (!(%s < %s)) break;", idx, n)
+		f.blockGo(s.Body, true, lab, func(sc *genScope) {
+			v := info.Loops[s]
+			get := fmt.Sprintf("ks_arr_%s_get(%s, %s)", k, arr, idx)
+			if v.Type.Managed() {
+				f.line("%s %s = ks_retain(%s);", cType(v.Type), v.CName, get)
+				sc.vars = append(sc.vars, v.CName)
+			} else {
+				f.line("%s %s = %s;", cType(v.Type), v.CName, get)
+			}
+		})
+		f.line("%s:", lab)
+		f.line("%s = ks_add(%s, 1);", idx, idx)
+		f.ind--
+		f.line("}")
+	} else {
+		start := f.evalKept(s.Start)
+		end := f.evalKept(s.End)
+		v := info.Loops[s]
+		f.line("int64_t %s = %s;", v.CName, start)
+		op := "<"
+		if s.Kind == ForInclusive {
+			op = "<="
+		}
+		f.line("while (1) {")
+		f.ind++
+		f.line("if (!(%s %s %s)) break;", v.CName, op, end)
+		f.blockGo(s.Body, true, lab, nil)
+		f.line("%s:", lab)
+		if s.Kind == ForInclusive {
+			f.line("if (%s == %s) break;", v.CName, end)
+		}
+		f.line("%s = ks_add(%s, 1);", v.CName, v.CName)
+		f.ind--
+		f.line("}")
+	}
+	f.releaseScope(outer)
+	f.scopes = f.scopes[:len(f.scopes)-1]
+	f.ind--
+	f.line("}")
 }
 
 func (f *fnGen) condition(e Expr) string {
@@ -463,9 +565,43 @@ func (f *fnGen) assign(s *AssignStmt) {
 	f.line("*%s = %s;", ptr, rv)
 }
 
+func (f *fnGen) stringify(e Expr) string {
+	switch f.g.info.Types[e].Kind {
+	case KInt:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_int(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	case KFloat:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_float(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	case KBool:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_bool(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	default:
+		return f.eval(e)
+	}
+}
+
+func (f *fnGen) fmtCall(e *CallExpr) (string, bool) {
+	format := f.eval(e.Args[0])
+	parts := make([]string, len(e.Args)-1)
+	for i, a := range e.Args[1:] {
+		parts[i] = f.stringify(a)
+	}
+	call := fmt.Sprintf("ks_fmt(%s, 0, NULL)", format)
+	if len(parts) > 0 {
+		call = fmt.Sprintf("ks_fmt(%s, %d, (ks_obj *[]){%s})", format, len(parts), strings.Join(parts, ", "))
+	}
+	return f.temp("ks_obj *", call), true
+}
+
 func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 	info := f.g.info
 	switch name {
+	case "fmt":
+		return f.fmtCall(e)
 	case "push":
 		root, steps := f.prepPlace(e.Args[0])
 		arrT := info.Types[e.Args[0]]

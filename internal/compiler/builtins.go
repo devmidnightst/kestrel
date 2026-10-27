@@ -1,5 +1,7 @@
 package compiler
 
+import "fmt"
+
 type builtinSig struct {
 	params []Type
 	result Type
@@ -52,6 +54,7 @@ var builtinNames = map[string]bool{
 	"len": true, "str": true, "abs": true, "min": true, "max": true,
 	"push": true, "pop": true, "fill": true, "slice": true,
 	"has": true, "keys": true, "values": true,
+	"fmt": true,
 }
 
 func init() {
@@ -86,6 +89,8 @@ func (c *checker) builtin(e *CallExpr, name string) Type {
 		return sig.result
 	}
 	switch name {
+	case "fmt":
+		return c.builtinFmt(e)
 	case "len":
 		if !argc(1) {
 			return IntType
@@ -239,4 +244,65 @@ func mapKey(t Type) Type {
 		return t.Key
 	}
 	return nil
+}
+
+func (c *checker) builtinFmt(e *CallExpr) Type {
+	c.info.Builtins[e] = "fmt"
+	if len(e.Args) == 0 {
+		c.errorf(e.Pos, "fmt expects a format string and one value for each {}")
+		return StringType
+	}
+	got := c.exprWant(e.Args[0], StringType)
+	if got != Invalid && got != StringType {
+		c.errorf(e.Args[0].P(), "argument 1 of fmt must be string, not %s", got)
+	}
+	holes := -1
+	if lit, ok := e.Args[0].(*StringLit); ok {
+		n, msg := formatHoles(lit.Value)
+		if msg != "" {
+			c.errorf(lit.Pos, "fmt format: %s", msg)
+		} else {
+			holes = n
+		}
+	}
+	for i, a := range e.Args[1:] {
+		t := c.valueExpr(a)
+		if t != Invalid && !t.Comparable() {
+			c.errorf(a.P(), "argument %d of fmt must be int, float, bool or string, not %s (print shows arrays, maps and structs)", i+2, t)
+		}
+	}
+	nargs := len(e.Args) - 1
+	if holes >= 0 && holes != nargs {
+		c.errorf(e.Pos, "fmt format has %d {} placeholder%s, got %d value%s", holes, plural(holes), nargs, plural(nargs))
+	}
+	return StringType
+}
+
+// formatHoles counts {} placeholders. {{ and }} are literal braces.
+// The returned message is empty when the format is valid. Byte positions
+// start at 1.
+func formatHoles(s string) (int, string) {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			if i+1 < len(s) && s[i+1] == '{' {
+				i++
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '}' {
+				n++
+				i++
+				continue
+			}
+			return 0, fmt.Sprintf("unclosed or unsupported '{' at byte %d (only {} is a placeholder, and {{ is a literal brace)", i+1)
+		case '}':
+			if i+1 < len(s) && s[i+1] == '}' {
+				i++
+				continue
+			}
+			return 0, fmt.Sprintf("lone '}' at byte %d (write }} for a literal brace)", i+1)
+		}
+	}
+	return n, ""
 }

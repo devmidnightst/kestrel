@@ -175,9 +175,11 @@ func (g *randProg) expr(t Type, depth int) string {
 			return fmt.Sprintf("(%s %s %s)", g.expr(FloatType, d), op, g.expr(FloatType, d))
 		}
 	case StringType:
-		switch g.r.Intn(6) {
+		switch g.r.Intn(7) {
 		case 0:
 			return fmt.Sprintf("str(%s)", g.expr([]Type{IntType, FloatType, BoolType}[g.r.Intn(3)], d))
+		case 4:
+			return g.fmtExpr(d)
 		case 1:
 			return g.index(g.expr(randStrArr, d), d)
 		case 2:
@@ -258,8 +260,45 @@ func (g *randProg) place(depth int) (string, Type, bool) {
 	return v.Name, v.Type, true
 }
 
+func (g *randProg) boundedArray(t Type) string {
+	switch t {
+	case randIntArr:
+		return fmt.Sprintf("[%d, %d]", g.r.Intn(5), g.r.Intn(5))
+	case randStrArr:
+		return fmt.Sprintf("[%s]", g.stringLit())
+	default:
+		return fmt.Sprintf("[%s]", g.leaf(randPair))
+	}
+}
+
+func (g *randProg) fmtExpr(d int) string {
+	n := g.r.Intn(3)
+	var b strings.Builder
+	b.WriteByte('"')
+	if g.r.Intn(2) == 0 {
+		b.WriteString("{{")
+	}
+	args := make([]string, n)
+	for i := 0; i < n; i++ {
+		if i > 0 && g.r.Intn(2) == 0 {
+			b.WriteByte('-')
+		}
+		b.WriteString("{}")
+		if g.r.Intn(3) == 0 {
+			b.WriteString("}}")
+		}
+		t := []Type{IntType, FloatType, BoolType, StringType}[g.r.Intn(4)]
+		args[i] = g.expr(t, d)
+	}
+	b.WriteByte('"')
+	if n == 0 {
+		return fmt.Sprintf("fmt(%s)", b.String())
+	}
+	return fmt.Sprintf("fmt(%s, %s)", b.String(), strings.Join(args, ", "))
+}
+
 func (g *randProg) stmt(depth int, result Type, loop bool) {
-	choice := g.r.Intn(13)
+	choice := g.r.Intn(15)
 	if depth <= 0 && choice >= 8 {
 		choice = g.r.Intn(8)
 	}
@@ -356,6 +395,30 @@ func (g *randProg) stmt(depth int, result Type, loop bool) {
 		} else {
 			g.line("return %s;", g.expr(result, 3))
 		}
+	case 13:
+		name := g.fresh("i")
+		var elem Type
+		switch g.r.Intn(3) {
+		case 0:
+			g.line("for %s in ((%s) %% 3)..((%s) %% 3) {", name, g.expr(IntType, 2), g.expr(IntType, 2))
+			elem = IntType
+		case 1:
+			g.line("for %s in ((%s) %% 3)..=((%s) %% 3) {", name, g.expr(IntType, 2), g.expr(IntType, 2))
+			elem = IntType
+		default:
+			arrT := []Type{randIntArr, randStrArr, randPairs}[g.r.Intn(3)]
+			g.line("for %s in %s {", name, g.boundedArray(arrT))
+			elem = arrT.Elem
+		}
+		g.scopes = append(g.scopes, nil)
+		g.declare(name, elem, false)
+		g.body(depth-1, result, true)
+		g.scopes = g.scopes[:len(g.scopes)-1]
+		g.line("}")
+	case 14:
+		name := g.fresh("s")
+		g.line("let %s = %s;", name, g.fmtExpr(2))
+		g.declare(name, StringType, false)
 	}
 }
 

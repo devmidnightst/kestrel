@@ -804,6 +804,63 @@ KS_RT void ks_exit(int64_t code) {
 KS_RT void ks_assert(bool cond, ks_obj *msg) {
 	if (!cond) ks_panicf("assertion failed: %.400s", KS_S(msg)->data);
 }
+
+KS_RT int64_t ks_fmt_holes(ks_str *fmt) {
+	int64_t n = 0;
+	for (int64_t i = 0; i < fmt->len; i++) {
+		char c = fmt->data[i];
+		if (c == '{') {
+			if (i + 1 < fmt->len && fmt->data[i + 1] == '{') { i++; continue; }
+			if (i + 1 < fmt->len && fmt->data[i + 1] == '}') { n++; i++; continue; }
+			ks_panic("fmt: unclosed or unsupported '{' (only {} is a placeholder)");
+		}
+		if (c == '}') {
+			if (i + 1 < fmt->len && fmt->data[i + 1] == '}') { i++; continue; }
+			ks_panic("fmt: lone '}' (write }} for a literal brace)");
+		}
+	}
+	return n;
+}
+
+KS_RT ks_obj *ks_fmt(ks_obj *fmto, int64_t n, ks_obj **args) {
+	ks_str *fmt = KS_S(fmto);
+	int64_t holes = ks_fmt_holes(fmt);
+	if (holes != n) ks_panicf("fmt: format has %" PRId64 " {} placeholders, got %" PRId64 " values", holes, n);
+	int64_t outlen = 0;
+	int64_t ai = 0;
+	for (int64_t i = 0; i < fmt->len; i++) {
+		char c = fmt->data[i];
+		if (c == '{' && fmt->data[i + 1] == '{') { outlen++; i++; continue; }
+		if (c == '}' && fmt->data[i + 1] == '}') { outlen++; i++; continue; }
+		if (c == '{') {
+			ks_str *a = KS_S(args[ai++]);
+			if (a->len > INT64_MAX - outlen) ks_panic("string too long");
+			outlen += a->len;
+			i++;
+			continue;
+		}
+		if (outlen == INT64_MAX) ks_panic("string too long");
+		outlen++;
+	}
+	char *d;
+	ks_obj *r = ks_str_alloc(outlen, &d);
+	int64_t w = 0;
+	ai = 0;
+	for (int64_t i = 0; i < fmt->len; i++) {
+		char c = fmt->data[i];
+		if (c == '{' && fmt->data[i + 1] == '{') { d[w++] = '{'; i++; continue; }
+		if (c == '}' && fmt->data[i + 1] == '}') { d[w++] = '}'; i++; continue; }
+		if (c == '{') {
+			ks_str *a = KS_S(args[ai++]);
+			if (a->len > 0) memcpy(d + w, a->data, (size_t)a->len);
+			w += a->len;
+			i++;
+			continue;
+		}
+		d[w++] = c;
+	}
+	return r;
+}
 `
 
 func runtimeC() string {

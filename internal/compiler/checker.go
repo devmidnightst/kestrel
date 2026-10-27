@@ -56,6 +56,7 @@ func Check(modules []*Module, entry *Module) (*Program, error) {
 			Types:    map[Expr]Type{},
 			Uses:     map[*Ident]*Var{},
 			Defs:     map[*LetStmt]*Var{},
+			Loops:    map[*ForStmt]*Var{},
 			Calls:    map[*CallExpr]*Func{},
 			Builtins: map[*CallExpr]string{},
 			Fields:   map[*SelectorExpr]*Field{},
@@ -409,6 +410,39 @@ func (c *checker) checkStmt(s Stmt) {
 		c.loops++
 		c.checkBlock(s.Body)
 		c.loops--
+	case *ForStmt:
+		c.loops++
+		var elem Type
+		switch s.Kind {
+		case ForRange, ForInclusive:
+			start := c.valueExpr(s.Start)
+			end := c.valueExpr(s.End)
+			if start != Invalid && start != IntType {
+				c.errorf(s.Start.P(), "range start must be int, not %s", start)
+			}
+			if end != Invalid && end != IntType {
+				c.errorf(s.End.P(), "range end must be int, not %s", end)
+			}
+			elem = IntType
+		default:
+			seq := c.valueExpr(s.Seq)
+			switch {
+			case seq == Invalid:
+				elem = Invalid
+			case seq.Kind != KArray:
+				c.errorf(s.Seq.P(), "for expects an array, not %s (ranges are for i in start..end)", seq)
+				elem = Invalid
+			default:
+				elem = seq.Elem
+			}
+		}
+		c.push()
+		v := c.newVar(s.Name, elem, false, s.NamePos)
+		c.info.Loops[s] = v
+		c.declare(v)
+		c.checkStmts(s.Body.Stmts)
+		c.pop()
+		c.loops--
 	case *ReturnStmt:
 		want := c.fn.Result
 		if s.Value == nil {
@@ -436,11 +470,11 @@ func (c *checker) checkStmt(s Stmt) {
 		c.allowMut = nil
 	case *BreakStmt:
 		if c.loops == 0 {
-			c.errorf(s.Pos, "break outside of a while loop")
+			c.errorf(s.Pos, "break outside of a loop")
 		}
 	case *ContinueStmt:
 		if c.loops == 0 {
-			c.errorf(s.Pos, "continue outside of a while loop")
+			c.errorf(s.Pos, "continue outside of a loop")
 		}
 	case *BlockStmt:
 		c.checkBlock(s.Block)

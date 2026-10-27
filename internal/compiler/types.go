@@ -166,6 +166,7 @@ type Info struct {
 	Types    map[Expr]Type
 	Uses     map[*Ident]*Var
 	Defs     map[*LetStmt]*Var
+	Loops    map[*ForStmt]*Var
 	Calls    map[*CallExpr]*Func
 	Builtins map[*CallExpr]string
 	Fields   map[*SelectorExpr]*Field

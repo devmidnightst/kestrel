@@ -294,6 +294,7 @@ func (p *parser) parseCond() Expr {
 	p.noStruct = true
 	x := p.parseExpr()
 	p.noStruct = saved
+	p.rejectRange()
 	if p.at(LBrace) && p.peekKind(1) == IdentTok && p.peekKind(2) == Colon {
 		p.fail(p.tok().Pos, "struct literals in if and while conditions must be wrapped in parentheses")
 	}
@@ -325,6 +326,7 @@ func (p *parser) parseStmt() Stmt {
 		}
 		p.expect(Assign, "in variable declaration (variables must be initialized)")
 		s.Value = p.parseExpr()
+		p.rejectRange()
 		p.expect(Semicolon, "after variable declaration")
 		return s
 	case KwIf:
@@ -333,6 +335,8 @@ func (p *parser) parseStmt() Stmt {
 		p.next()
 		cond := p.parseCond()
 		return &WhileStmt{Pos: t.Pos, Cond: cond, Body: p.parseBlock()}
+	case KwFor:
+		return p.parseFor()
 	case KwReturn:
 		p.next()
 		s := &ReturnStmt{Pos: t.Pos}
@@ -359,6 +363,7 @@ func (p *parser) parseStmt() Stmt {
 		return &BlockStmt{Block: p.parseBlock()}
 	}
 	x := p.parseExpr()
+	p.rejectRange()
 	if p.at(Assign) {
 		if !isPlace(x) {
 			p.fail(p.tok().Pos, "cannot assign to this expression (only variables, struct fields and array elements can be assigned)")
@@ -373,6 +378,50 @@ func (p *parser) parseStmt() Stmt {
 	}
 	p.expect(Semicolon, "after expression statement")
 	return &ExprStmt{Pos: t.Pos, X: x}
+}
+
+func (p *parser) sawRange() bool {
+	return p.at(Dot) && p.peekKind(1) == Dot
+}
+
+func (p *parser) rejectRange() {
+	if p.sawRange() {
+		p.fail(p.tok().Pos, "a range is only allowed in for (for i in start..end or for i in start..=end)")
+	}
+}
+
+func (p *parser) parseFor() *ForStmt {
+	p.enter()
+	defer p.leave()
+	t := p.next()
+	name := p.expectIdent("after for")
+	p.expect(KwIn, "after the loop variable (for x in ...)")
+	s := &ForStmt{Pos: t.Pos, Name: name.Text, NamePos: name.Pos}
+	// The '{' of the body would otherwise be read as a struct literal.
+	saved := p.noStruct
+	p.noStruct = true
+	start := p.parseExpr()
+	if p.sawRange() {
+		p.next()
+		p.next()
+		s.Kind = ForRange
+		if p.at(Assign) {
+			p.next()
+			s.Kind = ForInclusive
+		}
+		s.Start = start
+		s.End = p.parseExpr()
+		p.rejectRange()
+	} else {
+		s.Kind = ForArray
+		s.Seq = start
+	}
+	p.noStruct = saved
+	if p.at(LBrace) && p.peekKind(1) == IdentTok && p.peekKind(2) == Colon {
+		p.fail(p.tok().Pos, "struct literals in for must be wrapped in parentheses")
+	}
+	s.Body = p.parseBlock()
+	return s
 }
 
 func (p *parser) parseIf() Stmt {
@@ -396,6 +445,7 @@ func (p *parser) parseList(end Kind, context string) []Expr {
 	p.withStructLits(func() {
 		for !p.at(end) {
 			list = append(list, p.parseExpr())
+			p.rejectRange()
 			if !p.at(Comma) {
 				break
 			}
@@ -464,6 +514,9 @@ func (p *parser) parsePostfix() Expr {
 	for {
 		switch p.tok().Kind {
 		case Dot:
+			if p.peekKind(1) == Dot {
+				return x
+			}
 			p.next()
 			name := p.expectIdent("after \".\"")
 			x = &SelectorExpr{X: x, Name: name.Text, NamePos: name.Pos}

@@ -184,6 +184,9 @@ func TestParseErrors(t *testing.T) {
 		{"fn main() { let v = (1 + 2)(3); }", "p.ks:1:28: error: only named functions can be called"},
 		{"import lib;", "p.ks:1:8: error: expected module path string after import, found identifier \"lib\""},
 		{"import c \"stdio.h\" { fn puts(); ", "p.ks:1:33: error: unterminated c import block"},
+		{"fn main() { let s = 0..1; }", "a range is only allowed in for"},
+		{"fn main() { for 1 in 0..1 { } }", "expected identifier after for"},
+		{"fn main() { for i in 0..1..2 { } }", "a range is only allowed in for"},
 	}
 	for _, c := range cases {
 		_, err := Parse("p.ks", []byte(c.src))

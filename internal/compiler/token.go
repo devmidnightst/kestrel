@@ -18,6 +18,8 @@ const (
 	KwIf
 	KwElse
 	KwWhile
+	KwFor
+	KwIn
 	KwReturn
 	KwPrint
 	KwTrue
@@ -69,6 +71,8 @@ var kindText = map[Kind]string{
 	KwIf:       "if",
 	KwElse:     "else",
 	KwWhile:    "while",
+	KwFor:      "for",
+	KwIn:       "in",
 	KwReturn:   "return",
 	KwPrint:    "print",
 	KwTrue:     "true",
@@ -114,6 +118,8 @@ var keywords = map[string]Kind{
 	"if":       KwIf,
 	"else":     KwElse,
 	"while":    KwWhile,
+	"for":      KwFor,
+	"in":       KwIn,
 	"return":   KwReturn,
 	"print":    KwPrint,
 	"true":     KwTrue,

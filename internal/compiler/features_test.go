@@ -187,6 +187,84 @@ fn main() {
 fn main() {
     print(pick(["a", "b", "c"], "b"), pick([], "z"));
 }`, "found b none\n"},
+	{"for range", `fn main() {
+    var s = 0;
+    for i in 0..5 { s = s + i; }
+    var t = 0;
+    for i in 1..=4 {
+        if i == 2 { continue; }
+        if i == 4 { break; }
+        t = t + i;
+    }
+    var neg = 0;
+    for i in -2..2 { neg = neg + i; }
+    var one = 0;
+    for i in 3..=3 { one = one + 1; }
+    var none = 0;
+    for i in 5..5 { none = none + 1; }
+    for i in 4..2 { none = none + 1; }
+    for i in 9223372036854775807..=9223372036854775807 { one = one + 1; }
+    print(s, t, neg, one, none);
+}`, "10 4 -2 2 0\n"},
+	{"for array", `struct box { n: int }
+fn main() {
+    var words = ["go", "to", "the"];
+    var n = 0;
+    for w in words {
+        if w == "to" { continue; }
+        n = n + len(w);
+    }
+    var nums = [1, 2];
+    var extra = 0;
+    for x in nums {
+        push(nums, x);
+        extra = extra + x;
+    }
+    var boxes = [box { n: 7 }];
+    var seen = 0;
+    for b in boxes {
+        var c = b;
+        c.n = 1;
+        seen = seen + b.n;
+    }
+    var empty: [int] = [];
+    var hits = 0;
+    for x in empty { hits = hits + x; }
+    var acc = 0;
+    for i in 0..3 {
+        var j = 0;
+        while j < 2 {
+            j = j + 1;
+            if j == 1 { continue; }
+        }
+        acc = acc + i;
+    }
+    print(n, extra, len(nums), seen, boxes[0].n, hits, acc);
+}`, "5 3 4 7 7 0 3\n"},
+	{"for return", `fn first(xs: [string]) -> string {
+    for s in xs {
+        if len(s) > 0 { return s; }
+    }
+    return "";
+}
+fn main() {
+    print(first(["", "ab", "c"]));
+}`, "ab\n"},
+	{"fmt and print", `struct pair { a: int, b: string }
+fn main() {
+    print(fmt("{} is {}", "kestrel", 2026));
+    print(fmt("braces {{ }} and {}", true));
+    print(fmt("pi {}", 3.5));
+    print(fmt("none"));
+    print(fmt("{}", "a{b}"));
+    print(fmt("{{{}}}", 7));
+    var pat = "x{}";
+    print(fmt(pat, false));
+    var m: {string: int} = {};
+    m["a"] = 1;
+    var empty: {int: int} = {};
+    print(1, [1, 2], pair { a: 1, b: "x" }, m, empty);
+}`, "kestrel is 2026\nbraces { } and true\npi 3.5\nnone\na{b}\n{7}\nxfalse\n1 [1, 2] pair { a: 1, b: \"x\" } {\"a\": 1} {}\n"},
 }
 
 func TestFeatures(t *testing.T) {

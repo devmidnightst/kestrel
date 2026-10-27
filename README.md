@@ -81,14 +81,18 @@ contents: arrays and structs are values, not shared references.
 - types: `int` (signed 64-bit), `float` (64-bit), `bool`, `string`, arrays
   `[t]`, maps `{string: t}` and `{int: t}`, and structs
 - `let` (immutable) and `var` (mutable) with lexical block scope
-- functions, recursion, `if` / `else if` / `else`, `while`, `break`,
-  `continue`, `return`, `print`
+- functions, recursion, `if` / `else if` / `else`, `while`, `for i in 0..n`,
+  `for i in 0..=n`, `for x in array`, `break`, `continue`, `return`, `print`
 - value semantics with automatic memory management: reference counting plus
   copy-on-write. memory is freed as soon as it is unreachable, and since values
   cannot form cycles, nothing leaks
 - safety checks that stop the program with a clear message and exit status
   101: integer overflow, division by zero, out of range indexing, stack
   overflow from deep recursion, bad conversions, failed `assert`
+- `fmt("{} is {}", a, b)` builds a string. `{}` is a hole, `{{` and `}}` are
+  literal braces, and the values must be int, float, bool or string. a format
+  written as a string literal is checked at compile time. `print` accepts
+  every value, including arrays, maps and structs
 - builtins for strings (`split`, `join`, `find`, `substr`, `trim`, `upper`,
   ...), math (`sqrt`, `pow`, `abs`, `min`, `max`, ...), arrays (`push`, `pop`,
   `fill`, `slice`, `len`), parsing (`parse_int`, `parse_float`), input
@@ -111,8 +115,9 @@ contents: arrays and structs are values, not shared references.
 ## what does not exist
 
 no generics, closures, methods, enums, tuples, optional or error types,
-`for` loops, globals, concurrency, TLS, or unicode-aware string
-functions (strings are bytes). arrays and structs cannot be compared with
+globals, concurrency, TLS, or unicode-aware string
+functions (strings are bytes). `for` walks integer ranges and arrays; it does
+not walk maps. arrays and structs cannot be compared with
 `==`. errors that a real program might want to recover from (a missing file,
 a bad number) either return a bool or stop the program; there is no way to
 catch them. TCP is blocking and single-connection: there is no HTTP library
@@ -134,6 +139,8 @@ kestrel run examples/variables.ks
 kestrel run examples/functions.ks
 kestrel run examples/branching.ks
 kestrel run examples/loops.ks
+kestrel run examples/for.ks
+kestrel run examples/fmt.ks
 kestrel run examples/arrays.ks
 kestrel run examples/structs.ks
 kestrel run examples/modules/main.ks

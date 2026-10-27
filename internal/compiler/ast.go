@@ -122,6 +122,27 @@ type WhileStmt struct {
 	Body *Block
 }
 
+type ForKind int
+
+const (
+	ForRange ForKind = iota
+	ForInclusive
+	ForArray
+)
+
+// ForStmt is `for name in start..end`, `for name in start..=end`, or
+// `for name in array`. The name is in scope only in the body.
+type ForStmt struct {
+	Pos     Pos
+	Name    string
+	NamePos Pos
+	Kind    ForKind
+	Start   Expr
+	End     Expr
+	Seq     Expr
+	Body    *Block
+}
+
 type ReturnStmt struct {
 	Pos   Pos
 	Value Expr
@@ -239,6 +260,7 @@ func (s *LetStmt) P() Pos      { return s.Pos }
 func (s *AssignStmt) P() Pos   { return s.Pos }
 func (s *IfStmt) P() Pos       { return s.Pos }
 func (s *WhileStmt) P() Pos    { return s.Pos }
+func (s *ForStmt) P() Pos      { return s.Pos }
 func (s *ReturnStmt) P() Pos   { return s.Pos }
 func (s *PrintStmt) P() Pos    { return s.Pos }
 func (s *ExprStmt) P() Pos     { return s.Pos }
@@ -263,6 +285,7 @@ func (*LetStmt) stmtNode()      {}
 func (*AssignStmt) stmtNode()   {}
 func (*IfStmt) stmtNode()       {}
 func (*WhileStmt) stmtNode()    {}
+func (*ForStmt) stmtNode()      {}
 func (*ReturnStmt) stmtNode()   {}
 func (*PrintStmt) stmtNode()    {}
 func (*ExprStmt) stmtNode()     {}

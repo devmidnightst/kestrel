@@ -22,8 +22,8 @@ production track record, and this document makes no performance promises.
 ## Lexical elements
 
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*` (ASCII only).
-- Keywords: `fn pub struct let var if else while return print true false
-  import as break continue`.
+- Keywords: `fn pub struct let var if else while for in return print true
+  false import as break continue`.
 - Integer literals: decimal digits, `0` to `9223372036854775807`. `-5` is unary
   minus applied to `5`; as a special case `-9223372036854775808` is accepted.
 - Float literals: `1.5`, `0.25`, `2e10`, `1.5e-3`. A literal needs digits on
@@ -111,6 +111,7 @@ statement = ("let" | "var") IDENT [ ":" type ] "=" expr ";"
           | place "=" expr ";"
           | "if" expr block [ "else" ( if_stmt | block ) ]
           | "while" expr block
+          | "for" IDENT "in" expr [ ".." [ "=" ] expr ] block
           | "return" [ expr ] ";"
           | "print" "(" [ expr { "," expr } ] ")" ";"
           | "break" ";" | "continue" ";"
@@ -134,17 +135,51 @@ place     = IDENT { "[" expr "]" | "." IDENT } .
   to right, then the right-hand side, then the store happens.
 - `if` and `while` conditions must be `bool`. Braces are required. A struct
   literal inside a condition must be wrapped in parentheses.
-- `break` and `continue` are only valid inside `while`.
+- `break` and `continue` are only valid inside `while` or `for`. They apply
+  to the innermost loop. `continue` in a `for` still advances the loop.
 - A function with a result type must end in a `return` on every path. The
   check is syntactic: the last statement must be a `return`, a block ending in
-  one, or an `if`/`else` chain whose branches all end in one. `while true` does
-  not count.
+  one, or an `if`/`else` chain whose branches all end in one. `while true` and
+  `for` do not count, because the body might not run.
 - Only function calls may be used as expression statements.
 - `print` writes its arguments separated by single spaces plus a newline.
-  Strings print raw at the top level and quoted inside arrays and structs.
-  Arrays print as `[1, 2]`, structs as `Point { x: 1.0, y: 2.0 }`. Floats print
-  in the shortest form that reads back as the same value, with `.0` added to
-  whole numbers. Standard output is line buffered.
+  It accepts every value type. Strings print raw at the top level and quoted
+  inside arrays, maps and structs. Arrays print as `[1, 2]`, maps as
+  `{"a": 1}` in the same order as `keys`, structs as `Point { x: 1.0, y: 2.0 }`.
+  Floats print in the shortest form that reads
+  back as the same value, with `.0` added to whole numbers. Standard output
+  is line buffered.
+
+### for
+
+```
+for i in 0..n { }     // i is 0, 1, ..., n-1
+for i in 0..=n { }    // i is 0, 1, ..., n
+for x in items { }    // x is each element of an array
+```
+
+- `..` excludes the end. `..=` includes it. Both count upward by 1. If the
+  start is already past the end (`start > end`, or `start == end` for `..`),
+  the body does not run. There is no downward range.
+- The two bounds are evaluated once, left to right, before the body. A range
+  is not an expression; `let x = 0..n` is an error that says to use `for`.
+- The loop variable is a new immutable binding in the body only. Assigning to
+  it is an error. It shadows an outer variable of the same name inside the
+  body, and it is not visible after the loop.
+- `for x in items` evaluates the array once and walks that value. `x` is a
+  copy of each element (value semantics). Pushing onto the original variable
+  during the loop does not change how many elements this loop visits, and it
+  does not change the copies already produced. The loop holds its own retain
+  of the array, so a later mutation copies instead of altering the walk.
+- The step after an inclusive end is not computed. `for i in max..=max`,
+  where `max` is the largest int, runs once and does not overflow.
+- `for` does not walk maps or strings. Iterate `keys(m)` if you need the keys,
+  then index the map. Map iteration order would be hash order.
+- `break` leaves the loop. `continue` abandons the rest of the body and
+  advances. A `while` nested inside `for` has its own `break` and `continue`.
+- A struct literal in the `for` header must be wrapped in parentheses, same
+  as in an `if` or `while` condition. `for x in [item { n: 1 }]` is fine
+  because the literal is inside the array.
 
 ## Expressions
 
@@ -214,6 +249,7 @@ User functions may shadow builtin names.
 | `tcp_read(fd, max) -> string` | one read of at most `max` bytes (capped at 1 MiB). `""` on end of stream or error |
 | `tcp_write(fd, data) -> int` | bytes written, or `-1` |
 | `tcp_close(fd)` | close a socket. A bad descriptor is ignored |
+| `fmt(format, ...)` | replace each `{}` in a string. `{{` and `}}` are literal braces. A string literal is checked at compile time for hole syntax and argument count; a computed format is checked at run time and stops the program on a mismatch. Values must be int, float, bool or string, rendered the same way as `print`. Arrays, maps and structs are rejected (use `print`) |
 | `has(m, key) -> bool` | true if the map contains `key` |
 | `keys(m) -> [K]` | the map's keys, in hash order |
 | `values(m) -> [V]` | the map's values, in the same order as `keys` |
@@ -311,8 +347,9 @@ Windows is not.
 ## Not supported
 
 Generics, closures and first-class functions, methods, interfaces, enums,
-maps/dictionaries, tuples, optional or error types, exceptions, `for` loops,
-compound assignment (`+=`), global variables and constants, string indexing by
+tuples, optional or error types, exceptions, iteration over maps, compound
+assignment (`+=`), global variables and constants, string indexing by
 character, Unicode-aware string operations, deep equality on arrays and
-structs, concurrency, networking, directory operations, environment variables,
-Go package interop, and arbitrary C FFI.
+structs, concurrency, TLS, directory operations, environment variables, Go
+package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
+`{:.2}` and no `{0}`).
