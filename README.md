@@ -18,6 +18,14 @@ before betting anything on it.
 
 ## install
 
+prebuilt binaries for linux and macos (amd64 and arm64) are attached to
+[github releases](https://github.com/devmidnightst/kestrel/releases) when a
+`v*` tag is pushed. unpack the archive and put `kestrel` on your `PATH`.
+compiling a kestrel program still needs `cc`, `gcc`, or `clang` on that
+machine. the binaries are the compiler, not a replacement for a c toolchain.
+
+from source:
+
 ```sh
 go build -o kestrel ./cmd/kestrel
 ```
@@ -148,8 +156,7 @@ generated programs (plain and sanitized) on linux (gcc and clang) and macos
 
 ## license
 
-no license file has been chosen yet. until one is added, the default copyright
-rules apply and others have no permission to use, copy or modify the code.
+[mit](LICENSE). copyright 2026 midnight.
 
 ## layout
 
