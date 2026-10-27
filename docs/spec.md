@@ -206,6 +206,13 @@ User functions may shadow builtin names.
 | `read_file(path) -> string` | whole file; runtime error if it cannot be read |
 | `write_file(path, content) -> bool` | creates or replaces a file; false on failure |
 | `file_exists(path) -> bool` | true if the file can be opened for reading |
+| `tcp_listen(host, port) -> int` | listening socket, or `-1`. `port` 0 asks the operating system for a free port. One accept at a time; there is no concurrency |
+| `tcp_port(fd) -> int` | local port of a socket, or `-1` |
+| `tcp_accept(fd) -> int` | next connection, or `-1`. Blocks until a client connects |
+| `tcp_connect(host, port) -> int` | connected socket, or `-1` |
+| `tcp_read(fd, max) -> string` | one read of at most `max` bytes (capped at 1 MiB). `""` on end of stream or error |
+| `tcp_write(fd, data) -> int` | bytes written, or `-1` |
+| `tcp_close(fd)` | close a socket. A bad descriptor is ignored |
 | `exit(code: int)` | flush standard output and exit immediately |
 | `assert(cond: bool, message: string)` | runtime error with the message if `cond` is false |
 
@@ -230,7 +237,8 @@ flush standard output, and exit immediately with status 101. They cover
 integer overflow, division by zero, index and range errors, `pop` on an empty
 array, invalid `parse_int`/`parse_float` input, invalid conversions,
 unreadable files in `read_file`, failed `assert`s, out of memory, and stack
-overflow.
+overflow. Socket functions do not raise those errors: they return `-1` or `""`
+so a server loop can keep running when a client disconnects.
 
 Every function checks the remaining stack on entry. Recursion that would
 overflow the stack is reported as `stack overflow (recursion too deep)`. The

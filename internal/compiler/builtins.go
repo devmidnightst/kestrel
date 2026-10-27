@@ -37,6 +37,13 @@ var fixedBuiltins = map[string]builtinSig{
 	"read_file":   {[]Type{StringType}, StringType, "ks_read_file"},
 	"write_file":  {[]Type{StringType, StringType}, BoolType, "ks_write_file"},
 	"file_exists": {[]Type{StringType}, BoolType, "ks_file_exists"},
+	"tcp_listen":  {[]Type{StringType, IntType}, IntType, "ks_tcp_listen"},
+	"tcp_port":    {[]Type{IntType}, IntType, "ks_tcp_port"},
+	"tcp_accept":  {[]Type{IntType}, IntType, "ks_tcp_accept"},
+	"tcp_connect": {[]Type{StringType, IntType}, IntType, "ks_tcp_connect"},
+	"tcp_read":    {[]Type{IntType, IntType}, StringType, "ks_tcp_read"},
+	"tcp_write":   {[]Type{IntType, StringType}, IntType, "ks_tcp_write"},
+	"tcp_close":   {[]Type{IntType}, Void, "ks_tcp_close"},
 	"exit":        {[]Type{IntType}, Void, "ks_exit"},
 	"assert":      {[]Type{BoolType, StringType}, Void, "ks_assert"},
 }

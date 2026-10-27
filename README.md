@@ -84,8 +84,10 @@ contents: arrays and structs are values, not shared references.
 - builtins for strings (`split`, `join`, `find`, `substr`, `trim`, `upper`,
   ...), math (`sqrt`, `pow`, `abs`, `min`, `max`, ...), arrays (`push`, `pop`,
   `fill`, `slice`, `len`), parsing (`parse_int`, `parse_float`), input
-  (`read_line`, `eof`, `args`), and files (`read_file`, `write_file`,
-  `file_exists`)
+  (`read_line`, `eof`, `args`), files (`read_file`, `write_file`,
+  `file_exists`), and blocking TCP (`tcp_listen`, `tcp_accept`, `tcp_read`,
+  `tcp_write`, `tcp_close`). A server handles one connection at a time.
+  Failed sockets return `-1` or `""` instead of stopping the process
 - modules: `import "lib/x.ks";` with `pub fn` and `pub struct` exports. paths
   are relative and cannot escape the entry file's directory (symlinks
   included)
@@ -101,12 +103,14 @@ contents: arrays and structs are values, not shared references.
 ## what does not exist
 
 no generics, closures, methods, maps, enums, tuples, optional or error types,
-`for` loops, globals, concurrency, networking, or unicode-aware string
+`for` loops, globals, concurrency, TLS, or unicode-aware string
 functions (strings are bytes). arrays and structs cannot be compared with
 `==`. errors that a real program might want to recover from (a missing file,
 a bad number) either return a bool or stop the program; there is no way to
-catch them. the c import is not a general ffi: no strings, pointers, structs,
-callbacks, or extra libraries. there is no go package interop.
+catch them. TCP is blocking and single-connection: there is no HTTP library
+and no way to serve two clients at once. the c import is not a general ffi:
+no strings, pointers, structs, callbacks, or extra libraries. there is no go
+package interop.
 
 copy-on-write has a cost model worth knowing: changing a value that is still
 shared copies it first, so a function that takes an array, changes it and
