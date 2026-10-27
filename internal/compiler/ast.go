@@ -78,14 +78,16 @@ type Param struct {
 }
 
 type FuncDecl struct {
-	Pos     Pos
-	NamePos Pos
-	Pub     bool
-	Name    string
-	Params  []*Param
-	Result  *TypeExpr
-	Body    *Block
-	Header  string
+	Pos         Pos
+	NamePos     Pos
+	Pub         bool
+	Name        string
+	Recv        *Param
+	RecvMutable bool
+	Params      []*Param
+	Result      *TypeExpr
+	Body        *Block
+	Header      string
 }
 
 type Block struct {

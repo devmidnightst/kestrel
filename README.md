@@ -81,6 +81,10 @@ contents: arrays and structs are values, not shared references.
 - types: `int` (signed 64-bit), `float` (64-bit), `bool`, `string`, arrays
   `[t]`, maps `{string: t}` and `{int: t}`, and structs
 - `let` (immutable) and `var` (mutable) with lexical block scope
+- methods: `fn (self: item) cost(price: int) -> int`, called as `rope.cost(4)`.
+  `fn (var self: item) add(n: int)` updates the caller's place and is only
+  legal on a `var` (the same rule as `push`). an immutable receiver cannot
+  assign to `self`
 - functions, recursion, `if` / `else if` / `else`, `while`, `for i in 0..n`,
   `for i in 0..=n`, `for x in array`, `break`, `continue`, `return`, `print`
 - value semantics with automatic memory management: reference counting plus
@@ -114,7 +118,7 @@ contents: arrays and structs are values, not shared references.
 
 ## what does not exist
 
-no generics, closures, methods, enums, tuples, optional or error types,
+no generics, closures, enums, tuples, optional or error types,
 globals, concurrency, TLS, or unicode-aware string
 functions (strings are bytes). `for` walks integer ranges and arrays; it does
 not walk maps. arrays and structs cannot be compared with
@@ -141,6 +145,7 @@ kestrel run examples/branching.ks
 kestrel run examples/loops.ks
 kestrel run examples/for.ks
 kestrel run examples/fmt.ks
+kestrel run examples/methods.ks
 kestrel run examples/arrays.ks
 kestrel run examples/structs.ks
 kestrel run examples/modules/main.ks

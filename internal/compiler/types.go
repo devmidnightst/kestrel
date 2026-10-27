@@ -120,6 +120,7 @@ type StructInfo struct {
 	Decl     *StructDecl
 	Fields   []*Field
 	FieldMap map[string]*Field
+	Methods  map[string]*Func
 	Type     Type
 }
 
@@ -143,23 +144,27 @@ type Module struct {
 }
 
 type Func struct {
-	Name   string
-	CName  string
-	Params []*Var
-	Result Type
-	Pub    bool
-	Extern bool
-	Decl   *FuncDecl
-	Module *Module
+	Name        string
+	CName       string
+	Recv        *Var
+	RecvMutable bool
+	Params      []*Var
+	Result      Type
+	Pub         bool
+	Extern      bool
+	Decl        *FuncDecl
+	Module      *Module
 }
 
 type Var struct {
-	Name    string
-	CName   string
-	Type    Type
-	Mutable bool
-	Param   bool
-	Pos     Pos
+	Name     string
+	CName    string
+	Type     Type
+	Mutable  bool
+	Param    bool
+	Receiver bool
+	Slot     bool
+	Pos      Pos
 }
 
 type Info struct {

@@ -198,8 +198,21 @@ func (p *parser) parseFunc() *FuncDecl {
 }
 
 func (p *parser) parseSignature(start Pos, pub bool) *FuncDecl {
+	decl := &FuncDecl{Pos: start, Pub: pub}
+	if p.at(LParen) {
+		p.next()
+		if p.at(KwVar) {
+			decl.RecvMutable = true
+			p.next()
+		}
+		rn := p.expectIdent("for the receiver name, as in fn (self: item) name")
+		p.expect(Colon, "after the receiver name")
+		decl.Recv = &Param{Pos: rn.Pos, Name: rn.Text, Type: p.parseType()}
+		p.expect(RParen, "after the receiver")
+	}
 	name := p.expectIdent("for function name")
-	decl := &FuncDecl{Pos: start, NamePos: name.Pos, Pub: pub, Name: name.Text}
+	decl.Name = name.Text
+	decl.NamePos = name.Pos
 	p.expect(LParen, "after function name")
 	for !p.at(RParen) {
 		pn := p.expectIdent("for parameter name")

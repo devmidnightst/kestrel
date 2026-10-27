@@ -250,6 +250,19 @@ fn main() {
 fn main() {
     print(first(["", "ab", "c"]));
 }`, "ab\n"},
+	{"methods", `struct item { name: string, qty: int }
+struct box { it: item }
+fn (self: item) cost(price: int) -> int { return self.qty * price; }
+fn (self: item) label() -> string { return self.name; }
+fn (var self: item) add(n: int) { self.qty = self.qty + n; }
+fn main() {
+    var rope = item { name: "rope", qty: 3 };
+    let before = rope;
+    rope.add(2);
+    var b = box { it: item { name: "lamp", qty: 1 } };
+    b.it.add(9);
+    print(before.cost(4), rope.cost(4), before.qty, rope.qty, b.it.qty, rope.label());
+}`, "12 20 3 5 10 rope\n"},
 	{"fmt and print", `struct pair { a: int, b: string }
 fn main() {
     print(fmt("{} is {}", "kestrel", 2026));
@@ -276,6 +289,26 @@ func TestFeatures(t *testing.T) {
 				t.Errorf("exit %d, stderr %q\ngot:\n%s\nwant:\n%s", r.code, r.stderr, r.stdout, c.want)
 			}
 		})
+	}
+}
+
+func TestMethodAcrossModules(t *testing.T) {
+	requireCC(t)
+	dir := writeFiles(t, map[string]string{
+		"main.ks": "import \"item.ks\";\nfn main() {\n    var it = item.item { qty: 2 };\n    it.add(3);\n    print(it.cost(4));\n}\n",
+		"item.ks": "pub struct item { qty: int }\npub fn (self: item) cost(price: int) -> int { return self.qty * price; }\npub fn (var self: item) add(n: int) { self.qty = self.qty + n; }\n",
+	})
+	out, errOut, code := buildAndRun(t, filepath.Join(dir, "main.ks"))
+	if code != 0 || out != "20\n" {
+		t.Fatalf("exit %d, stderr %q, stdout %q", code, errOut, out)
+	}
+	hidden := writeFiles(t, map[string]string{
+		"main.ks": "import \"item.ks\";\nfn main() { let it = item.item { qty: 1 }; it.secret(); }\n",
+		"item.ks": "pub struct item { qty: int }\nfn (self: item) secret() {}\n",
+	})
+	_, err := Load(filepath.Join(hidden, "main.ks"))
+	if err == nil || !strings.Contains(err.Error(), "method item.secret is not public") {
+		t.Fatalf("private method: %v", err)
 	}
 }
 

@@ -243,9 +243,16 @@ func (g *gen) printFn(t Type) string {
 }
 
 func prototype(fn *Func) string {
-	params := make([]string, len(fn.Params))
-	for i, p := range fn.Params {
-		params[i] = fmt.Sprintf("%s %s", cType(p.Type), p.CName)
+	params := []string{}
+	if fn.Recv != nil {
+		if fn.Recv.Slot {
+			params = append(params, "ks_obj **"+fn.Recv.CName)
+		} else {
+			params = append(params, fmt.Sprintf("%s %s", cType(fn.Recv.Type), fn.Recv.CName))
+		}
+	}
+	for _, p := range fn.Params {
+		params = append(params, fmt.Sprintf("%s %s", cType(p.Type), p.CName))
 	}
 	if len(params) == 0 {
 		params = []string{"void"}

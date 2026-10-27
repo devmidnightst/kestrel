@@ -209,6 +209,7 @@ func TestExamples(t *testing.T) {
 		"wordfreq.ks":     "lines: 0\n",
 		"for.ks":          "10\n4\n7\n4\n",
 		"fmt.ks":          "kestrel is 2026\nbraces { } and true\npi 3.5\nnone\na{b}\n1 [1, 2] pair { a: 1, b: \"x\" }\n",
+		"methods.ks":      "12 20\n3 5\n",
 	}
 	for name, want := range examples {
 		t.Run(name, func(t *testing.T) {

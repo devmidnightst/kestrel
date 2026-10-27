@@ -226,6 +226,10 @@ func (c *checker) collectFuncs(m *Module) {
 	}
 	for _, ci := range m.File.CImports {
 		for _, d := range ci.Externs {
+			if d.Recv != nil {
+				c.errorf(d.Pos, "c functions cannot be methods")
+				continue
+			}
 			fn := c.signature(m, d)
 			fn.Extern = true
 			fn.CName = d.Name
@@ -251,10 +255,46 @@ func (c *checker) collectFuncs(m *Module) {
 	}
 	for _, d := range m.File.Funcs {
 		fn := c.signature(m, d)
-		fn.CName = fmt.Sprintf("ks_f%d_%s", m.ID, d.Name)
 		fn.Pub = d.Pub
+		if d.Recv != nil {
+			c.attachMethod(m, fn)
+			continue
+		}
+		fn.CName = fmt.Sprintf("ks_f%d_%s", m.ID, d.Name)
 		declare(fn)
 	}
+}
+
+func (c *checker) attachMethod(m *Module, fn *Func) {
+	d := fn.Decl
+	if d.Name == "main" {
+		c.errorf(d.NamePos, "main cannot be a method")
+	}
+	t := fn.Recv.Type
+	if t == nil || t.Kind != KStruct || t.Struct == nil || t.Struct.Module != m {
+		got := Type(Invalid)
+		if t != nil {
+			got = t
+		}
+		c.errorf(d.Recv.Type.Pos, "a method receiver must be a struct declared in this module, not %s", got)
+		fn.CName = fmt.Sprintf("ks_bad_%s", d.Name)
+		m.Order = append(m.Order, fn)
+		return
+	}
+	si := t.Struct
+	fn.CName = fmt.Sprintf("ks_m%d_%s_%s", si.ID, si.Name, d.Name)
+	if si.FieldMap[d.Name] != nil {
+		c.errorf(d.NamePos, "method %s.%s conflicts with a field of the same name", si.Name, d.Name)
+	}
+	if si.Methods == nil {
+		si.Methods = map[string]*Func{}
+	}
+	if prev := si.Methods[d.Name]; prev != nil {
+		c.errorf(d.NamePos, "method %s.%s already declared at %d:%d", si.Name, d.Name, prev.Decl.NamePos.Line, prev.Decl.NamePos.Col)
+	} else {
+		si.Methods[d.Name] = fn
+	}
+	m.Order = append(m.Order, fn)
 }
 
 func sameSignature(a, b *Func) bool {
@@ -272,9 +312,21 @@ func sameSignature(a, b *Func) bool {
 func (c *checker) signature(m *Module, d *FuncDecl) *Func {
 	fn := &Func{Name: d.Name, Decl: d, Module: m, Result: c.resolveType(m, d.Result)}
 	seen := map[string]bool{}
+	if d.Recv != nil {
+		fn.RecvMutable = d.RecvMutable
+		fn.Recv = &Var{
+			Name: d.Recv.Name, Type: c.resolveType(m, d.Recv.Type), Pos: d.Recv.Pos,
+			Mutable: d.RecvMutable, Receiver: true, Slot: d.RecvMutable,
+		}
+		seen[d.Recv.Name] = true
+	}
 	for _, p := range d.Params {
 		if seen[p.Name] {
-			c.errorf(p.Pos, "duplicate parameter %s", p.Name)
+			if d.Recv != nil && p.Name == d.Recv.Name {
+				c.errorf(p.Pos, "parameter %s has the same name as the receiver", p.Name)
+			} else {
+				c.errorf(p.Pos, "duplicate parameter %s", p.Name)
+			}
 		}
 		seen[p.Name] = true
 		fn.Params = append(fn.Params, &Var{Name: p.Name, Type: c.resolveType(m, p.Type), Pos: p.Pos, Param: true})
@@ -308,6 +360,11 @@ func (c *checker) checkFunc(fn *Func) {
 	c.scope = nil
 	c.loops = 0
 	c.push()
+	if fn.Recv != nil {
+		c.nextVar++
+		fn.Recv.CName = fmt.Sprintf("ks_v%d_%s", c.nextVar, fn.Recv.Name)
+		c.declare(fn.Recv)
+	}
 	for _, p := range fn.Params {
 		c.nextVar++
 		p.CName = fmt.Sprintf("ks_v%d_%s", c.nextVar, p.Name)
@@ -515,6 +572,9 @@ func (c *checker) placeType(e Expr, whole Expr) Type {
 		}
 		c.info.Uses[e] = v
 		switch {
+		case v.Receiver && !v.Mutable:
+			c.errorf(e.Pos, "cannot assign to %s: %s is an immutable receiver (write fn (var %s: %s) to modify the caller)", describePlace(whole), v.Name, v.Name, v.Type)
+			return Invalid
 		case v.Param:
 			c.errorf(e.Pos, "cannot assign to %s: %s is a parameter (copy it into a var first)", describePlace(whole), v.Name)
 			return Invalid
@@ -881,15 +941,10 @@ func (c *checker) call(e *CallExpr) Type {
 			c.errorf(callee.Pos, "undefined function: %s", name)
 		}
 	case *SelectorExpr:
-		m, alias, ok := c.moduleRef(callee.X)
-		if !ok {
-			if id, isIdent := callee.X.(*Ident); isIdent && c.scope.lookup(id.Name) == nil {
-				c.errorf(id.Pos, "undefined: %s", id.Name)
-				break
-			}
-			c.errorf(callee.NamePos, "%s is not a function; only functions can be called", describePlace(callee))
-			break
+		if _, _, ok := c.moduleRef(callee.X); !ok {
+			return c.methodCall(e, callee)
 		}
+		m, alias, _ := c.moduleRef(callee.X)
 		name = alias + "." + callee.Name
 		f := m.Funcs[callee.Name]
 		switch {
@@ -925,6 +980,88 @@ func (c *checker) call(e *CallExpr) Type {
 		}
 	}
 	return fn.Result
+}
+
+func (c *checker) methodCall(e *CallExpr, callee *SelectorExpr) Type {
+	recvT := c.valueExpr(callee.X)
+	label := callee.Name
+	if recvT != nil && recvT != Invalid {
+		label = recvT.String() + "." + callee.Name
+	}
+	var fn *Func
+	if recvT != nil && recvT.Kind == KStruct && recvT.Struct != nil {
+		fn = recvT.Struct.Methods[callee.Name]
+	}
+	if fn == nil {
+		switch {
+		case recvT == Invalid || recvT == nil:
+		case recvT.Kind == KStruct && recvT.Struct != nil && recvT.Struct.FieldMap[callee.Name] != nil:
+			c.errorf(callee.NamePos, "%s is a field of %s, not a method", callee.Name, recvT)
+		default:
+			c.errorf(callee.NamePos, "%s has no method %s", recvT, callee.Name)
+		}
+		for _, a := range e.Args {
+			c.valueExpr(a)
+		}
+		return Invalid
+	}
+	if fn.Module != c.mod && !fn.Pub {
+		c.errorf(callee.NamePos, "method %s is not public (declare it with pub fn)", label)
+	}
+	if fn.RecvMutable {
+		if !isPlace(callee.X) {
+			c.errorf(callee.X.P(), "%s changes its receiver, so the receiver must be a var, field or element", label)
+		} else {
+			c.requireMutable(callee.X)
+		}
+	}
+	c.info.Calls[e] = fn
+	if len(e.Args) != len(fn.Params) {
+		for _, a := range e.Args {
+			c.valueExpr(a)
+		}
+		c.errorf(e.Pos, "%s expects %d argument%s, got %d", label, len(fn.Params), plural(len(fn.Params)), len(e.Args))
+		return fn.Result
+	}
+	for i, a := range e.Args {
+		want := fn.Params[i].Type
+		got := c.exprWant(a, want)
+		if got != Invalid && want != Invalid && got != want {
+			c.errorf(a.P(), "argument %d of %s must be %s, not %s", i+1, label, want, got)
+		}
+	}
+	return fn.Result
+}
+
+func (c *checker) requireMutable(e Expr) {
+	cur := e
+	for {
+		switch n := cur.(type) {
+		case *Ident:
+			v := c.info.Uses[n]
+			if v == nil {
+				v = c.scope.lookup(n.Name)
+			}
+			if v == nil {
+				return
+			}
+			switch {
+			case v.Receiver && !v.Mutable:
+				c.errorf(n.Pos, "cannot assign to %s: %s is an immutable receiver (write fn (var %s: %s) to modify the caller)", n.Name, v.Name, v.Name, v.Type)
+			case v.Param:
+				c.errorf(n.Pos, "cannot assign to %s: %s is a parameter (copy it into a var first)", n.Name, v.Name)
+			case !v.Mutable:
+				c.errorf(n.Pos, "cannot assign to %s: %s is immutable (declared with let at %d:%d; use var to allow assignment)", n.Name, v.Name, v.Pos.Line, v.Pos.Col)
+			}
+			return
+		case *IndexExpr:
+			cur = n.X
+		case *SelectorExpr:
+			cur = n.X
+		default:
+			return
+		}
+	}
 }
 
 func plural(n int) string {

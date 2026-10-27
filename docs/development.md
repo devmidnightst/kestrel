@@ -41,7 +41,8 @@ error exits immediately without freeing memory, by design.
 `randprog_test.go` generates well-typed Kestrel programs from fixed seeds:
 ints, floats, strings, arrays, nested arrays, structs with array fields,
 copies followed by mutation through paths like `v[i].items[j] = x`, `push` and
-`pop`, `while` and `for` loops with `break`/`continue`, `fmt`, early returns,
+`pop`, `while` and `for` loops with `break`/`continue`, `fmt`, method calls on
+`Pair` (`sum` and `bump`), early returns,
 and calls between generated functions. `for` bounds in generated programs are
 reduced modulo 3 so a random range cannot spin for a huge number of steps. Each program must type check, compile under strict C
 warning flags, and exit with status 0 or a Kestrel runtime error (101).

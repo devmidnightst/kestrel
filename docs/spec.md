@@ -84,7 +84,8 @@ import    = "import" STRING [ "as" IDENT ] ";"
           | "import" "c" STRING "{" { "fn" signature ";" } "}" .
 struct    = [ "pub" ] "struct" IDENT "{" [ field { "," field } [ "," ] ] "}" .
 field     = IDENT ":" type .
-function  = [ "pub" ] "fn" signature block .
+function  = [ "pub" ] "fn" [ receiver ] signature block .
+receiver  = "(" [ "var" ] IDENT ":" type ")" .
 signature = IDENT "(" [ param { "," param } ] ")" [ "->" type ] .
 param     = IDENT ":" type .
 type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
@@ -98,10 +99,44 @@ type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
   (`struct Node { kids: [Node] }`), but a struct may not contain itself
   directly or through other struct fields, since such a value could never be
   built.
-- A struct and a function in the same module may not share a name.
+- A struct and a function in the same module may not share a name. A method
+  may use the same name as a function, because `total(x)` and `x.total()`
+  are different calls. A method may not use the name of a field.
 - The entry file must define `fn main()` with no parameters, returning nothing
   (exit status 0) or `int` (the process exit status, truncated by the operating
   system). Use `args()` for command-line arguments.
+
+## Methods
+
+```
+fn (self: item) cost(price: int) -> int { return self.qty * price; }
+fn (var self: item) add(n: int) { self.qty = self.qty + n; }
+
+rope.add(2);
+print(rope.cost(4));
+```
+
+The receiver is written before the method name. Its name is any identifier;
+`self` is the convention used here. The receiver type must be a struct
+declared in the same module. `pub fn` makes the method visible to importers.
+`main` cannot be a method. A C import cannot declare one.
+
+`self` without `var` is an immutable borrow of the value. The method cannot
+assign to it or to its fields. `var self` is the caller's place: assigning
+`self.field` or `self` updates that place, and copy-on-write still applies
+when the value is shared with someone else. A `var` receiver is only legal
+when the call's receiver is a place rooted in a `var` (a variable, field, or
+element), the same rule as `push`. `item { qty: 1 }.add(1)` and `let x = ...;
+x.add(1)` are errors.
+
+This split keeps value semantics and the existing cost model. A method that
+returned an updated copy would copy the whole struct whenever the caller
+still held it. In-place mutation of a `var` does not. The `var` keyword on
+the receiver makes that mutation visible at the declaration, not hidden in
+the call.
+
+Methods are not first-class values. `item.cost` is not a function value.
+There is no inheritance and no method on `int`, `string`, arrays, or maps.
 
 ## Statements
 
@@ -346,7 +381,7 @@ Windows is not.
 
 ## Not supported
 
-Generics, closures and first-class functions, methods, interfaces, enums,
+Generics, closures and first-class functions, interfaces, enums,
 tuples, optional or error types, exceptions, iteration over maps, compound
 assignment (`+=`), global variables and constants, string indexing by
 character, Unicode-aware string operations, deep equality on arrays and

@@ -59,6 +59,9 @@ func (f *fnGen) function(fn *Func) {
 	fmt.Fprintf(f.out, "\nstatic %s {\n", prototype(fn))
 	f.ind = 1
 	f.line("ks_stack_check();")
+	if fn.Recv != nil {
+		f.line("(void)%s;", fn.Recv.CName)
+	}
 	for _, p := range fn.Params {
 		f.line("(void)%s;", p.CName)
 	}
@@ -373,7 +376,11 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 	case *StringLit:
 		return "(&" + f.g.literal(e.Value) + ".h)", false
 	case *Ident:
-		return info.Uses[e].CName, false
+		v := info.Uses[e]
+		if v.Slot {
+			return "(*" + v.CName + ")", false
+		}
+		return v.CName, false
 	case *UnaryExpr:
 		x := f.eval(e.X)
 		switch {
@@ -430,6 +437,9 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 			return f.builtin(e, name, t)
 		}
 		fn := info.Calls[e]
+		if fn.Recv != nil {
+			return f.methodCall(e, fn)
+		}
 		args := make([]string, len(e.Args))
 		for i, a := range e.Args {
 			args[i] = f.eval(a)
@@ -524,6 +534,9 @@ func (f *fnGen) prepPlace(target Expr) (*Var, []placeStep) {
 func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
 	info := f.g.info
 	ptr := "&" + root.CName
+	if root.Slot {
+		ptr = root.CName
+	}
 	for _, st := range steps {
 		switch e := st.expr.(type) {
 		case *IndexExpr:
@@ -563,6 +576,28 @@ func (f *fnGen) assign(s *AssignStmt) {
 		f.line("ks_release(*%s);", ptr)
 	}
 	f.line("*%s = %s;", ptr, rv)
+}
+
+func (f *fnGen) methodCall(e *CallExpr, fn *Func) (string, bool) {
+	sel := e.Fn.(*SelectorExpr)
+	var recv string
+	if fn.RecvMutable {
+		root, steps := f.prepPlace(sel.X)
+		recv = f.walkPlace(root, steps)
+	} else {
+		recv = f.eval(sel.X)
+	}
+	args := make([]string, 0, len(e.Args)+1)
+	args = append(args, recv)
+	for _, a := range e.Args {
+		args = append(args, f.eval(a))
+	}
+	call := fmt.Sprintf("%s(%s)", fn.CName, strings.Join(args, ", "))
+	if fn.Result == Void {
+		f.line("%s;", call)
+		return "", false
+	}
+	return f.temp(cType(fn.Result), call), fn.Result.Managed()
 }
 
 func (f *fnGen) stringify(e Expr) string {

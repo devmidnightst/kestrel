@@ -18,7 +18,7 @@ var (
 	randTypes  = []Type{IntType, BoolType, FloatType, StringType, randIntArr, randStrArr, randPair, randPairs}
 )
 
-const randPrelude = "struct Pair {\n    a: int,\n    b: string,\n    items: [int],\n}\n\n"
+const randPrelude = "struct Pair {\n    a: int,\n    b: string,\n    items: [int],\n}\n\nfn (self: Pair) sum() -> int {\n    return self.a + len(self.b);\n}\n\nfn (var self: Pair) bump() {\n    self.a = self.a + 1;\n}\n\n"
 
 type randFunc struct {
 	name   string
@@ -131,7 +131,7 @@ func (g *randProg) expr(t Type, depth int) string {
 	}
 	switch t {
 	case IntType:
-		switch g.r.Intn(8) {
+		switch g.r.Intn(9) {
 		case 0:
 			return fmt.Sprintf("len(%s)", g.expr(StringType, d))
 		case 1:
@@ -142,6 +142,8 @@ func (g *randProg) expr(t Type, depth int) string {
 			return fmt.Sprintf("(%s).a", g.expr(randPair, d))
 		case 4:
 			return fmt.Sprintf("-%s", g.expr(IntType, d))
+		case 5:
+			return fmt.Sprintf("(%s).sum()", g.expr(randPair, d))
 		default:
 			op := []string{"+", "-", "*", "/", "%"}[g.r.Intn(5)]
 			return fmt.Sprintf("(%s %s %s)", g.expr(IntType, d), op, g.expr(IntType, d))
@@ -298,7 +300,7 @@ func (g *randProg) fmtExpr(d int) string {
 }
 
 func (g *randProg) stmt(depth int, result Type, loop bool) {
-	choice := g.r.Intn(15)
+	choice := g.r.Intn(16)
 	if depth <= 0 && choice >= 8 {
 		choice = g.r.Intn(8)
 	}
@@ -419,6 +421,18 @@ func (g *randProg) stmt(depth int, result Type, loop bool) {
 		name := g.fresh("s")
 		g.line("let %s = %s;", name, g.fmtExpr(2))
 		g.declare(name, StringType, false)
+	case 15:
+		if vars := g.visible(randPair, true); len(vars) > 0 {
+			g.line("%s.bump();", vars[g.r.Intn(len(vars))].Name)
+			return
+		}
+		if vars := g.visible(randPair, false); len(vars) > 0 {
+			name := g.fresh("n")
+			g.line("let %s = %s.sum();", name, vars[g.r.Intn(len(vars))].Name)
+			g.declare(name, IntType, false)
+			return
+		}
+		g.line("print(0);")
 	}
 }
 
