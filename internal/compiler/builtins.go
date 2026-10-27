@@ -51,6 +51,7 @@ var fixedBuiltins = map[string]builtinSig{
 var builtinNames = map[string]bool{
 	"len": true, "str": true, "abs": true, "min": true, "max": true,
 	"push": true, "pop": true, "fill": true, "slice": true,
+	"has": true, "keys": true, "values": true,
 }
 
 func init() {
@@ -90,8 +91,8 @@ func (c *checker) builtin(e *CallExpr, name string) Type {
 			return IntType
 		}
 		t := c.valueExpr(e.Args[0])
-		if t != Invalid && t != StringType && t.Kind != KArray {
-			c.errorf(e.Args[0].P(), "len expects a string or an array, not %s", t)
+		if t != Invalid && t != StringType && t.Kind != KArray && t.Kind != KMap {
+			c.errorf(e.Args[0].P(), "len expects a string, an array or a map, not %s", t)
 		}
 		return IntType
 	case "str":
@@ -188,6 +189,54 @@ func (c *checker) builtin(e *CallExpr, name string) Type {
 			return Invalid
 		}
 		return t
+	case "has":
+		if !argc(2) {
+			return BoolType
+		}
+		t := c.valueExpr(e.Args[0])
+		if t != Invalid && t.Kind != KMap {
+			c.errorf(e.Args[0].P(), "has expects a map, not %s", t)
+			c.valueExpr(e.Args[1])
+			return BoolType
+		}
+		kt := c.exprWant(e.Args[1], mapKey(t))
+		if t != Invalid && kt != Invalid && kt != t.Key {
+			c.errorf(e.Args[1].P(), "map key must be %s, not %s", t.Key, kt)
+		}
+		return BoolType
+	case "keys":
+		if !argc(1) {
+			return Invalid
+		}
+		t := c.valueExpr(e.Args[0])
+		if t != Invalid && t.Kind != KMap {
+			c.errorf(e.Args[0].P(), "keys expects a map, not %s", t)
+			return Invalid
+		}
+		if t == Invalid {
+			return Invalid
+		}
+		return ArrayOf(t.Key)
+	case "values":
+		if !argc(1) {
+			return Invalid
+		}
+		t := c.valueExpr(e.Args[0])
+		if t != Invalid && t.Kind != KMap {
+			c.errorf(e.Args[0].P(), "values expects a map, not %s", t)
+			return Invalid
+		}
+		if t == Invalid {
+			return Invalid
+		}
+		return ArrayOf(t.Elem)
 	}
 	panic("unknown builtin " + name)
+}
+
+func mapKey(t Type) Type {
+	if t != nil && t.Kind == KMap {
+		return t.Key
+	}
+	return nil
 }

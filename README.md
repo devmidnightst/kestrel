@@ -71,7 +71,7 @@ contents: arrays and structs are values, not shared references.
 ## what exists
 
 - types: `int` (signed 64-bit), `float` (64-bit), `bool`, `string`, arrays
-  `[t]`, and structs
+  `[t]`, maps `{string: t}` and `{int: t}`, and structs
 - `let` (immutable) and `var` (mutable) with lexical block scope
 - functions, recursion, `if` / `else if` / `else`, `while`, `break`,
   `continue`, `return`, `print`
@@ -102,7 +102,7 @@ contents: arrays and structs are values, not shared references.
 
 ## what does not exist
 
-no generics, closures, methods, maps, enums, tuples, optional or error types,
+no generics, closures, methods, enums, tuples, optional or error types,
 `for` loops, globals, concurrency, TLS, or unicode-aware string
 functions (strings are bytes). arrays and structs cannot be compared with
 `==`. errors that a real program might want to recover from (a missing file,

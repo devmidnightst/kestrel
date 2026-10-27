@@ -42,6 +42,7 @@ production track record, and this document makes no performance promises.
 | `bool`      | `true` or `false`                                               |
 | `string`    | immutable byte string with a length (may contain any byte)      |
 | `[T]`       | growable array of `T`, for any type `T` (including `[[T]]`)     |
+| `{K: V}`    | map from `string` or `int` keys to `V`                          |
 | `Name`      | a struct declared in the same module                            |
 | `mod.Name`  | a `pub struct` declared in an imported module                   |
 
@@ -86,7 +87,7 @@ field     = IDENT ":" type .
 function  = [ "pub" ] "fn" signature block .
 signature = IDENT "(" [ param { "," param } ] ")" [ "->" type ] .
 param     = IDENT ":" type .
-type      = "[" type "]" | IDENT [ "." IDENT ] .
+type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
 ```
 
 - Imports come before all declarations. There are no global variables or
@@ -179,7 +180,7 @@ User functions may shadow builtin names.
 
 | function | description |
 |----------|-------------|
-| `len(x)` | bytes in a string or elements in an array |
+| `len(x)` | bytes in a string, elements in an array, or entries in a map |
 | `str(x)` | int, float, bool or string to string |
 | `float(i: int) -> float` | conversion |
 | `int(f: float) -> int` | truncates toward zero; error for nan or out of range |
@@ -213,6 +214,9 @@ User functions may shadow builtin names.
 | `tcp_read(fd, max) -> string` | one read of at most `max` bytes (capped at 1 MiB). `""` on end of stream or error |
 | `tcp_write(fd, data) -> int` | bytes written, or `-1` |
 | `tcp_close(fd)` | close a socket. A bad descriptor is ignored |
+| `has(m, key) -> bool` | true if the map contains `key` |
+| `keys(m) -> [K]` | the map's keys, in hash order |
+| `values(m) -> [V]` | the map's values, in the same order as `keys` |
 | `exit(code: int)` | flush standard output and exit immediately |
 | `assert(cond: bool, message: string)` | runtime error with the message if `cond` is false |
 

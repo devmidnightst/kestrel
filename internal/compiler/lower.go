@@ -284,8 +284,12 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 	case *BinaryExpr:
 		return f.binary(e, t)
 	case *IndexExpr:
+		baseT := info.Types[e.X]
 		a := f.eval(e.X)
 		i := f.eval(e.Index)
+		if baseT.Kind == KMap {
+			return f.temp(cType(t), fmt.Sprintf("ks_map_%s_get(%s, %s)", mapKind(baseT), a, i)), false
+		}
 		return f.temp(cType(t), fmt.Sprintf("ks_arr_%s_get(%s, %s)", arrKind(t), a, i)), false
 	case *SelectorExpr:
 		s := f.eval(e.X)
@@ -299,6 +303,15 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 			f.line("ks_arr_%s_push(%s, %s);", k, arr, v)
 		}
 		return arr, true
+	case *MapLit:
+		k := mapKind(t)
+		m := f.temp("ks_obj *", fmt.Sprintf("ks_map_%s_new(%d)", k, len(e.Entries)))
+		for _, en := range e.Entries {
+			kk := f.eval(en.Key)
+			vv := f.evalOwnedTemp(en.Value)
+			f.line("ks_map_%s_set(%s, %s, %s);", k, m, kk, vv)
+		}
+		return m, true
 	case *StructLit:
 		si := info.Literals[e]
 		vals := map[string]string{}
@@ -389,7 +402,8 @@ func (f *fnGen) prepPlace(target Expr) (*Var, []placeStep) {
 			}
 			for i := range steps {
 				if ix, ok := steps[i].expr.(*IndexExpr); ok {
-					steps[i].idx = f.temp("int64_t", f.eval(ix.Index))
+					it := f.g.info.Types[ix.Index]
+					steps[i].idx = f.temp(cType(it), f.eval(ix.Index))
 				}
 			}
 			return f.g.info.Uses[e], steps
@@ -413,7 +427,12 @@ func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
 		case *IndexExpr:
 			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
 			elem := info.Types[e]
-			ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_arr_%s_slot(%s, %s)", arrKind(elem), u, st.idx))
+			baseT := info.Types[e.X]
+			if baseT.Kind == KMap {
+				ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_map_%s_slot(%s, %s)", mapKind(baseT), u, st.idx))
+			} else {
+				ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_arr_%s_slot(%s, %s)", arrKind(elem), u, st.idx))
+			}
 		case *SelectorExpr:
 			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
 			si := info.Types[e.X].Struct
@@ -424,6 +443,16 @@ func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
 }
 
 func (f *fnGen) assign(s *AssignStmt) {
+	if ix, ok := s.Target.(*IndexExpr); ok && f.g.info.Types[ix.X] != nil && f.g.info.Types[ix.X].Kind == KMap {
+		key := f.eval(ix.Index)
+		val := f.evalOwnedTemp(s.Value)
+		root, steps := f.prepPlace(ix.X)
+		ptr := f.walkPlace(root, steps)
+		mt := f.g.info.Types[ix.X]
+		u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+		f.line("ks_map_%s_set(%s, %s, %s);", mapKind(mt), u, key, val)
+		return
+	}
 	root, steps := f.prepPlace(s.Target)
 	t := f.g.info.Types[s.Target]
 	rv := f.evalOwnedTemp(s.Value)
@@ -469,6 +498,9 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 		if argT == StringType {
 			return f.temp("int64_t", call("ks_str_len")), false
 		}
+		if argT.Kind == KMap {
+			return f.temp("int64_t", call("ks_map_"+mapKind(argT)+"_len")), false
+		}
 		return f.temp("int64_t", call("ks_arr_"+arrKind(argT.Elem)+"_len")), false
 	case "str":
 		switch argT.Kind {
@@ -493,6 +525,12 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 		return f.temp(cType(t), call("ks_"+name+suffix)), false
 	case "slice":
 		return f.temp("ks_obj *", call("ks_arr_"+arrKind(t.Elem)+"_slice")), true
+	case "has":
+		return f.temp("bool", call("ks_map_"+mapKind(argT)+"_has")), false
+	case "keys":
+		return f.temp("ks_obj *", call("ks_map_"+mapKind(argT)+"_keys")), true
+	case "values":
+		return f.temp("ks_obj *", call("ks_map_"+mapKind(argT)+"_values")), true
 	}
 	sig := fixedBuiltins[name]
 	if sig.result == Void {
