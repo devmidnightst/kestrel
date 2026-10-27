@@ -53,6 +53,20 @@ type featureCase struct {
 }
 
 var featureCases = []featureCase{
+	{"string map", `fn main() {
+    var m: {string: int} = {};
+    m["a"] = 1;
+    m["b"] = 2;
+    m["a"] = 3;
+    var copy = m;
+    copy["a"] = 9;
+    print(m["a"], m["b"], copy["a"], has(m, "b"), has(m, "missing"), len(m));
+}`, "3 2 9 true false 2\n"},
+	{"int map", `fn main() {
+    var m = { 1: "one", 2: "two" };
+    m[2] = "TWO";
+    print(m[1], m[2], len(m), len(keys(m)), len(values(m)));
+}`, "one TWO 2 2 2\n"},
 	{"array basics", `fn main() {
     var a = [1, 2, 3];
     push(a, 4);

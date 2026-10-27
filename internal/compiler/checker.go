@@ -108,6 +108,15 @@ func (c *checker) resolveType(m *Module, t *TypeExpr) Type {
 	if t == nil {
 		return Void
 	}
+	if t.Key != nil {
+		key := c.resolveType(m, t.Key)
+		val := c.resolveType(m, t.Elem)
+		if key != Invalid && key != StringType && key != IntType {
+			c.errorf(t.Pos, "map keys must be string or int, not %s", key)
+			return Invalid
+		}
+		return MapOf(key, val)
+	}
 	if t.Elem != nil {
 		return ArrayOf(c.resolveType(m, t.Elem))
 	}
@@ -483,13 +492,18 @@ func (c *checker) placeType(e Expr, whole Expr) Type {
 	case *IndexExpr:
 		base := c.place(e.X, whole)
 		idx := c.valueExpr(e.Index)
-		if idx != Invalid && idx != IntType {
-			c.errorf(e.Index.P(), "array index must be int, not %s", idx)
-		}
 		switch base.Kind {
 		case KInvalid:
 			return Invalid
+		case KMap:
+			if idx != Invalid && base.Key != Invalid && idx != base.Key {
+				c.errorf(e.Index.P(), "map key must be %s, not %s", base.Key, idx)
+			}
+			return base.Elem
 		case KArray:
+			if idx != Invalid && idx != IntType {
+				c.errorf(e.Index.P(), "array index must be int, not %s", idx)
+			}
 			return base.Elem
 		case KString:
 			c.errorf(e.X.P(), "cannot assign into a string; strings are immutable")
@@ -542,6 +556,9 @@ func (c *checker) exprWant(e Expr, want Type) Type {
 	if lit, ok := e.(*ArrayLit); ok {
 		t = c.arrayLit(lit, want)
 		c.info.Types[e] = t
+	} else if lit, ok := e.(*MapLit); ok {
+		t = c.mapLit(lit, want)
+		c.info.Types[e] = t
 	} else {
 		t = c.expr(e)
 	}
@@ -576,6 +593,40 @@ func (c *checker) arrayLit(e *ArrayLit, want Type) Type {
 		}
 	}
 	return ArrayOf(elem)
+}
+
+func (c *checker) mapLit(e *MapLit, want Type) Type {
+	var keyWant, valWant Type
+	if want != nil && want.Kind == KMap {
+		keyWant, valWant = want.Key, want.Elem
+	}
+	if len(e.Entries) == 0 {
+		if keyWant != nil {
+			return want
+		}
+		c.errorf(e.Pos, "cannot infer the type of an empty map literal; add a type annotation such as let m: {string: int} = {};")
+		return Invalid
+	}
+	var keyT, valT Type = keyWant, valWant
+	for i, en := range e.Entries {
+		kt := c.exprWant(en.Key, keyT)
+		vt := c.exprWant(en.Value, valT)
+		if keyT == nil {
+			keyT = kt
+		} else if kt != Invalid && keyT != Invalid && kt != keyT {
+			c.errorf(en.Key.P(), "map key %d has type %s, expected %s", i+1, kt, keyT)
+		}
+		if valT == nil {
+			valT = vt
+		} else if vt != Invalid && valT != Invalid && vt != valT {
+			c.errorf(en.Value.P(), "map value %d has type %s, expected %s", i+1, vt, valT)
+		}
+	}
+	if keyT != Invalid && keyT != StringType && keyT != IntType {
+		c.errorf(e.Pos, "map keys must be string or int, not %s", keyT)
+		return Invalid
+	}
+	return MapOf(keyT, valT)
 }
 
 func (c *checker) expr(e Expr) Type {
@@ -632,13 +683,18 @@ func (c *checker) exprType(e Expr) Type {
 	case *IndexExpr:
 		base := c.valueExpr(e.X)
 		idx := c.valueExpr(e.Index)
-		if idx != Invalid && idx != IntType {
-			c.errorf(e.Index.P(), "array index must be int, not %s", idx)
-		}
 		switch base.Kind {
 		case KInvalid:
 			return Invalid
+		case KMap:
+			if idx != Invalid && base.Key != Invalid && idx != base.Key {
+				c.errorf(e.Index.P(), "map key must be %s, not %s", base.Key, idx)
+			}
+			return base.Elem
 		case KArray:
+			if idx != Invalid && idx != IntType {
+				c.errorf(e.Index.P(), "array index must be int, not %s", idx)
+			}
 			return base.Elem
 		case KString:
 			c.errorf(e.X.P(), "cannot index a string; use byte_at(s, i) or substr(s, start, count)")
@@ -648,6 +704,8 @@ func (c *checker) exprType(e Expr) Type {
 		return Invalid
 	case *ArrayLit:
 		return c.arrayLit(e, nil)
+	case *MapLit:
+		return c.mapLit(e, nil)
 	case *StructLit:
 		return c.structLit(e)
 	case *UnaryExpr:

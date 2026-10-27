@@ -827,5 +827,245 @@ func runtimeC() string {
 		sb.WriteString(src)
 	}
 	sb.WriteString(runtimeTail)
+	sb.WriteString(mapHelpers)
+	for _, inst := range mapInsts {
+		sb.WriteString(emitMap(inst))
+	}
 	return sb.String()
 }
+
+type mapInst struct {
+	name, keyC, valC      string
+	keyHash, keyEq        string
+	keyRetain, keyRelease string
+	valRetain, valRelease string
+	keyArr, valArr        string
+}
+
+var mapInsts = []mapInst{
+	{name: "i64_i64", keyC: "int64_t", valC: "int64_t", keyHash: "ks_hash_i64(key)", keyEq: "(a)==(b)", keyRetain: "(key)", keyRelease: "(void)(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "i64", valArr: "i64"},
+	{name: "i64_bool", keyC: "int64_t", valC: "bool", keyHash: "ks_hash_i64(key)", keyEq: "(a)==(b)", keyRetain: "(key)", keyRelease: "(void)(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "i64", valArr: "bool"},
+	{name: "i64_f64", keyC: "int64_t", valC: "double", keyHash: "ks_hash_i64(key)", keyEq: "(a)==(b)", keyRetain: "(key)", keyRelease: "(void)(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "i64", valArr: "f64"},
+	{name: "i64_obj", keyC: "int64_t", valC: "ks_obj *", keyHash: "ks_hash_i64(key)", keyEq: "(a)==(b)", keyRetain: "(key)", keyRelease: "(void)(key)", valRetain: "ks_retain(v)", valRelease: "ks_release(v)", keyArr: "i64", valArr: "obj"},
+	{name: "str_i64", keyC: "ks_obj *", valC: "int64_t", keyHash: "ks_hash_str(key)", keyEq: "ks_str_eq(a, b)", keyRetain: "ks_retain(key)", keyRelease: "ks_release(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "obj", valArr: "i64"},
+	{name: "str_bool", keyC: "ks_obj *", valC: "bool", keyHash: "ks_hash_str(key)", keyEq: "ks_str_eq(a, b)", keyRetain: "ks_retain(key)", keyRelease: "ks_release(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "obj", valArr: "bool"},
+	{name: "str_f64", keyC: "ks_obj *", valC: "double", keyHash: "ks_hash_str(key)", keyEq: "ks_str_eq(a, b)", keyRetain: "ks_retain(key)", keyRelease: "ks_release(key)", valRetain: "(v)", valRelease: "(void)(v)", keyArr: "obj", valArr: "f64"},
+	{name: "str_obj", keyC: "ks_obj *", valC: "ks_obj *", keyHash: "ks_hash_str(key)", keyEq: "ks_str_eq(a, b)", keyRetain: "ks_retain(key)", keyRelease: "ks_release(key)", valRetain: "ks_retain(v)", valRelease: "ks_release(v)", keyArr: "obj", valArr: "obj"},
+}
+
+const mapHelpers = `
+KS_RT uint64_t ks_hash_i64(int64_t k) {
+	uint64_t x = (uint64_t)k;
+	x ^= x >> 30;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27;
+	x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	return x;
+}
+
+KS_RT uint64_t ks_hash_str(ks_obj *o) {
+	ks_str *s = KS_S(o);
+	uint64_t h = 14695981039346656037ULL;
+	for (int64_t i = 0; i < s->len; i++) {
+		h ^= (unsigned char)s->data[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+`
+
+func emitMap(m mapInst) string {
+	n := "ks_map_" + m.name
+	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(mapTemplate,
+		"NAME", n),
+		"KEYC", m.keyC),
+		"VALC", m.valC),
+		"KEYHASH", m.keyHash),
+		"KEYEQ", m.keyEq),
+		"KEYRETAIN", m.keyRetain),
+		"KEYRELEASE", m.keyRelease),
+		"VALRETAIN", m.valRetain),
+		"VALRELEASE", m.valRelease),
+		"KEYARR", m.keyArr),
+		"VALARR", m.valArr)
+}
+
+const mapTemplate = `
+typedef struct {
+	ks_obj h;
+	int64_t len;
+	int64_t cap;
+	uint8_t *used;
+	KEYC *keys;
+	VALC *vals;
+} NAME;
+
+KS_RT void NAME_drop(ks_obj *o);
+KS_RT ks_obj *NAME_clone(ks_obj *o);
+
+KS_RT ks_obj *NAME_new(int64_t cap) {
+	if (cap < 8) cap = 8;
+	int64_t p2 = 8;
+	while (p2 < cap) {
+		if (p2 > INT64_MAX / 2) ks_panic("map too large");
+		p2 *= 2;
+	}
+	NAME *m = ks_alloc(sizeof *m);
+	ks_init_obj(&m->h, NAME_drop, NAME_clone);
+	m->len = 0;
+	m->cap = p2;
+	m->used = ks_alloc((size_t)p2);
+	memset(m->used, 0, (size_t)p2);
+	m->keys = ks_alloc((size_t)p2 * sizeof(KEYC));
+	m->vals = ks_alloc((size_t)p2 * sizeof(VALC));
+	return &m->h;
+}
+
+KS_RT void NAME_drop(ks_obj *o) {
+	NAME *m = (NAME *)o;
+	for (int64_t i = 0; i < m->cap; i++) {
+		if (m->used[i] != 1) continue;
+		KEYC key = m->keys[i];
+		KEYRELEASE;
+		VALC v = m->vals[i];
+		VALRELEASE;
+	}
+	free(m->used);
+	free(m->keys);
+	free(m->vals);
+	free(o);
+}
+
+KS_RT ks_obj *NAME_clone(ks_obj *o) {
+	NAME *m = (NAME *)o;
+	ks_obj *r = NAME_new(m->cap);
+	NAME *c = (NAME *)r;
+	c->len = m->len;
+	memcpy(c->used, m->used, (size_t)m->cap);
+	memcpy(c->keys, m->keys, (size_t)m->cap * sizeof(KEYC));
+	memcpy(c->vals, m->vals, (size_t)m->cap * sizeof(VALC));
+	for (int64_t i = 0; i < m->cap; i++) {
+		if (m->used[i] != 1) continue;
+		KEYC key = c->keys[i];
+		c->keys[i] = KEYRETAIN;
+		VALC v = c->vals[i];
+		c->vals[i] = VALRETAIN;
+	}
+	return r;
+}
+
+KS_RT int64_t NAME_len(ks_obj *o) {
+	return ((NAME *)o)->len;
+}
+
+KS_RT int64_t NAME_find(NAME *m, KEYC key, bool *found) {
+	uint64_t h = KEYHASH;
+	int64_t mask = m->cap - 1;
+	int64_t i = (int64_t)(h & (uint64_t)mask);
+	for (int64_t n = 0; n < m->cap; n++) {
+		if (m->used[i] == 0) { *found = false; return i; }
+		KEYC a = m->keys[i];
+		KEYC b = key;
+		if (KEYEQ) { *found = true; return i; }
+		i = (i + 1) & mask;
+	}
+	*found = false;
+	return 0;
+}
+
+KS_RT void NAME_grow(NAME *m) {
+	int64_t ncap = m->cap == 0 ? 8 : m->cap * 2;
+	if (m->cap > 0 && m->cap > INT64_MAX / 2) ks_panic("map too large");
+	uint8_t *used = ks_alloc((size_t)ncap);
+	memset(used, 0, (size_t)ncap);
+	KEYC *keys = ks_alloc((size_t)ncap * sizeof(KEYC));
+	VALC *vals = ks_alloc((size_t)ncap * sizeof(VALC));
+	uint8_t *oldu = m->used;
+	KEYC *oldk = m->keys;
+	VALC *oldv = m->vals;
+	int64_t ocap = m->cap;
+	m->used = used;
+	m->keys = keys;
+	m->vals = vals;
+	m->cap = ncap;
+	m->len = 0;
+	for (int64_t i = 0; i < ocap; i++) {
+		if (oldu[i] != 1) continue;
+		bool found = false;
+		int64_t slot = NAME_find(m, oldk[i], &found);
+		m->used[slot] = 1;
+		m->keys[slot] = oldk[i];
+		m->vals[slot] = oldv[i];
+		m->len++;
+	}
+	free(oldu);
+	free(oldk);
+	free(oldv);
+}
+
+KS_RT void NAME_set(ks_obj *o, KEYC key, VALC val) {
+	NAME *m = (NAME *)o;
+	if (m->cap == 0 || (m->len + 1) * 4 > m->cap * 3) NAME_grow(m);
+	bool found = false;
+	int64_t i = NAME_find(m, key, &found);
+	if (found) {
+		VALC v = m->vals[i];
+		VALRELEASE;
+		m->vals[i] = val;
+		return;
+	}
+	m->used[i] = 1;
+	m->keys[i] = KEYRETAIN;
+	m->vals[i] = val;
+	m->len++;
+}
+
+KS_RT bool NAME_has(ks_obj *o, KEYC key) {
+	NAME *m = (NAME *)o;
+	if (m->cap == 0) return false;
+	bool found = false;
+	NAME_find(m, key, &found);
+	return found;
+}
+
+KS_RT VALC NAME_get(ks_obj *o, KEYC key) {
+	NAME *m = (NAME *)o;
+	bool found = false;
+	int64_t i = 0;
+	if (m->cap != 0) i = NAME_find(m, key, &found);
+	if (!found) ks_panic("map key not found");
+	return m->vals[i];
+}
+
+KS_RT VALC *NAME_slot(ks_obj *o, KEYC key) {
+	NAME *m = (NAME *)o;
+	bool found = false;
+	int64_t i = 0;
+	if (m->cap != 0) i = NAME_find(m, key, &found);
+	if (!found) ks_panic("map key not found");
+	return &m->vals[i];
+}
+
+KS_RT ks_obj *NAME_keys(ks_obj *o) {
+	NAME *m = (NAME *)o;
+	ks_obj *a = ks_arr_KEYARR_new(m->len);
+	for (int64_t i = 0; i < m->cap; i++) {
+		if (m->used[i] != 1) continue;
+		KEYC key = m->keys[i];
+		ks_arr_KEYARR_push(a, KEYRETAIN);
+	}
+	return a;
+}
+
+KS_RT ks_obj *NAME_values(ks_obj *o) {
+	NAME *m = (NAME *)o;
+	ks_obj *a = ks_arr_VALARR_new(m->len);
+	for (int64_t i = 0; i < m->cap; i++) {
+		if (m->used[i] != 1) continue;
+		VALC v = m->vals[i];
+		ks_arr_VALARR_push(a, VALRETAIN);
+	}
+	return a;
+}
+`

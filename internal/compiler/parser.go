@@ -227,6 +227,14 @@ func (p *parser) parseType() *TypeExpr {
 		p.expect(RBracket, "to close array type")
 		return &TypeExpr{Pos: lb.Pos, Elem: elem}
 	}
+	if p.at(LBrace) {
+		lb := p.next()
+		key := p.parseType()
+		p.expect(Colon, "in map type")
+		val := p.parseType()
+		p.expect(RBrace, "to close map type")
+		return &TypeExpr{Pos: lb.Pos, Key: key, Elem: val}
+	}
 	t := p.expectIdent("for type")
 	te := &TypeExpr{Pos: t.Pos, Name: t.Text}
 	if p.at(Dot) {
@@ -235,6 +243,32 @@ func (p *parser) parseType() *TypeExpr {
 		te.Module, te.Name = t.Text, n.Text
 	}
 	return te
+}
+
+func (p *parser) parseMapLit(pos Pos) *MapLit {
+	p.enter()
+	defer p.leave()
+	p.next()
+	lit := &MapLit{Pos: pos}
+	if p.at(RBrace) {
+		p.next()
+		return lit
+	}
+	for {
+		key := p.parseExpr()
+		p.expect(Colon, "between map key and value")
+		val := p.parseExpr()
+		lit.Entries = append(lit.Entries, MapEntry{Key: key, Value: val})
+		if !p.at(Comma) {
+			break
+		}
+		p.next()
+		if p.at(RBrace) {
+			break
+		}
+	}
+	p.expect(RBrace, "to close map literal")
+	return lit
 }
 
 func (p *parser) parseBlock() *Block {
@@ -523,6 +557,8 @@ func (p *parser) parsePrimary() Expr {
 	case LBracket:
 		p.next()
 		return &ArrayLit{Pos: t.Pos, Elems: p.parseList(RBracket, "to close array literal")}
+	case LBrace:
+		return p.parseMapLit(t.Pos)
 	}
 	p.fail(t.Pos, "expected expression, found %s", t.describe())
 	return nil

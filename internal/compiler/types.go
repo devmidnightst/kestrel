@@ -12,12 +12,14 @@ const (
 	KFloat
 	KString
 	KArray
+	KMap
 	KStruct
 )
 
 type TypeDesc struct {
 	Kind   TypeKind
 	Elem   *TypeDesc
+	Key    *TypeDesc
 	Struct *StructInfo
 }
 
@@ -35,6 +37,8 @@ var (
 var (
 	arrayMu    sync.Mutex
 	arrayTypes = map[Type]Type{}
+	mapMu      sync.Mutex
+	mapTypes   = map[[2]Type]Type{}
 )
 
 func ArrayOf(elem Type) Type {
@@ -48,6 +52,21 @@ func ArrayOf(elem Type) Type {
 	}
 	t := &TypeDesc{Kind: KArray, Elem: elem}
 	arrayTypes[elem] = t
+	return t
+}
+
+func MapOf(key, val Type) Type {
+	if key == Invalid || val == Invalid {
+		return Invalid
+	}
+	mapMu.Lock()
+	defer mapMu.Unlock()
+	k := [2]Type{key, val}
+	if t, ok := mapTypes[k]; ok {
+		return t
+	}
+	t := &TypeDesc{Kind: KMap, Key: key, Elem: val}
+	mapTypes[k] = t
 	return t
 }
 
@@ -65,6 +84,8 @@ func (t *TypeDesc) String() string {
 		return "string"
 	case KArray:
 		return "[" + t.Elem.String() + "]"
+	case KMap:
+		return "{" + t.Key.String() + ": " + t.Elem.String() + "}"
 	case KStruct:
 		return t.Struct.Name
 	}
@@ -72,7 +93,7 @@ func (t *TypeDesc) String() string {
 }
 
 func (t *TypeDesc) Managed() bool {
-	return t.Kind == KString || t.Kind == KArray || t.Kind == KStruct
+	return t.Kind == KString || t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct
 }
 
 func (t *TypeDesc) Comparable() bool {

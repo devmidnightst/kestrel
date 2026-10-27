@@ -42,10 +42,13 @@ type TypeExpr struct {
 	Name   string
 	Module string
 	Elem   *TypeExpr
+	Key    *TypeExpr
 }
 
 func (t *TypeExpr) String() string {
 	switch {
+	case t.Key != nil:
+		return "{" + t.Key.String() + ": " + t.Elem.String() + "}"
 	case t.Elem != nil:
 		return "[" + t.Elem.String() + "]"
 	case t.Module != "":
@@ -208,6 +211,16 @@ type ArrayLit struct {
 	Elems []Expr
 }
 
+type MapLit struct {
+	Pos     Pos
+	Entries []MapEntry
+}
+
+type MapEntry struct {
+	Key   Expr
+	Value Expr
+}
+
 type StructLit struct {
 	Pos    Pos
 	Module string
@@ -243,6 +256,7 @@ func (e *CallExpr) P() Pos     { return e.Pos }
 func (e *SelectorExpr) P() Pos { return e.X.P() }
 func (e *IndexExpr) P() Pos    { return e.X.P() }
 func (e *ArrayLit) P() Pos     { return e.Pos }
+func (e *MapLit) P() Pos       { return e.Pos }
 func (e *StructLit) P() Pos    { return e.Pos }
 
 func (*LetStmt) stmtNode()      {}
@@ -267,4 +281,5 @@ func (*CallExpr) exprNode()     {}
 func (*SelectorExpr) exprNode() {}
 func (*IndexExpr) exprNode()    {}
 func (*ArrayLit) exprNode()     {}
+func (*MapLit) exprNode()       {}
 func (*StructLit) exprNode()    {}
