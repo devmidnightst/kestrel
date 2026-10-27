@@ -142,6 +142,8 @@ func TestRuntimeErrors(t *testing.T) {
 		"fn main() { print(4611686018427387904 * 2); }":                  "integer overflow",
 		"fn main() { let m = -9223372036854775807 - 1; print(-m); }":     "integer overflow",
 		"fn main() { let m = -9223372036854775807 - 1; print(m / -1); }": "integer overflow",
+		"fn main() { var s = \"{} {}\"; print(fmt(s, 1)); }":             "fmt: format has 2 {} placeholders, got 1 values",
+		"fn main() { var s = \"{\"; print(fmt(s, 1)); }":                 "fmt: unclosed or unsupported '{'",
 	}
 	for src, want := range cases {
 		out, errOut, code := runSource(t, src)
@@ -205,6 +207,10 @@ func TestExamples(t *testing.T) {
 		"arrays.ks":       "original: [42, 7, 19, 3, 88, 1]\nsorted: [1, 3, 7, 19, 42, 88]\npopped c left [\"a\", \"b\"]\nidentity: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]\nmiddle: [3, 7, 19, 42]\n",
 		"structs.ks":      "Item { name: \"rope\", price: 4.5, qty: 10 }\ntoday: 57.25 yesterday: 25.75\nInventory { owner: \"kes\", items: [Item { name: \"rope\", price: 4.5, qty: 3 }, Item { name: \"lamp\", price: 12.25, qty: 1 }] }\n",
 		"wordfreq.ks":     "lines: 0\n",
+		"for.ks":          "10\n4\n7\n4\n",
+		"fmt.ks":          "kestrel is 2026\nbraces { } and true\npi 3.5\nnone\na{b}\n1 [1, 2] pair { a: 1, b: \"x\" }\n",
+		"methods.ks":      "12 20\n3 5\n",
+		"maps.ks":         "true 3 1 1\n",
 	}
 	for name, want := range examples {
 		t.Run(name, func(t *testing.T) {

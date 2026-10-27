@@ -22,8 +22,8 @@ production track record, and this document makes no performance promises.
 ## Lexical elements
 
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*` (ASCII only).
-- Keywords: `fn pub struct let var if else while return print true false
-  import as break continue`.
+- Keywords: `fn pub struct let var if else while for in return print true
+  false import as break continue`.
 - Integer literals: decimal digits, `0` to `9223372036854775807`. `-5` is unary
   minus applied to `5`; as a special case `-9223372036854775808` is accepted.
 - Float literals: `1.5`, `0.25`, `2e10`, `1.5e-3`. A literal needs digits on
@@ -42,6 +42,7 @@ production track record, and this document makes no performance promises.
 | `bool`      | `true` or `false`                                               |
 | `string`    | immutable byte string with a length (may contain any byte)      |
 | `[T]`       | growable array of `T`, for any type `T` (including `[[T]]`)     |
+| `{K: V}`    | map from `string` or `int` keys to `V`                          |
 | `Name`      | a struct declared in the same module                            |
 | `mod.Name`  | a `pub struct` declared in an imported module                   |
 
@@ -83,10 +84,11 @@ import    = "import" STRING [ "as" IDENT ] ";"
           | "import" "c" STRING "{" { "fn" signature ";" } "}" .
 struct    = [ "pub" ] "struct" IDENT "{" [ field { "," field } [ "," ] ] "}" .
 field     = IDENT ":" type .
-function  = [ "pub" ] "fn" signature block .
+function  = [ "pub" ] "fn" [ receiver ] signature block .
+receiver  = "(" [ "var" ] IDENT ":" type ")" .
 signature = IDENT "(" [ param { "," param } ] ")" [ "->" type ] .
 param     = IDENT ":" type .
-type      = "[" type "]" | IDENT [ "." IDENT ] .
+type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
 ```
 
 - Imports come before all declarations. There are no global variables or
@@ -97,10 +99,44 @@ type      = "[" type "]" | IDENT [ "." IDENT ] .
   (`struct Node { kids: [Node] }`), but a struct may not contain itself
   directly or through other struct fields, since such a value could never be
   built.
-- A struct and a function in the same module may not share a name.
+- A struct and a function in the same module may not share a name. A method
+  may use the same name as a function, because `total(x)` and `x.total()`
+  are different calls. A method may not use the name of a field.
 - The entry file must define `fn main()` with no parameters, returning nothing
   (exit status 0) or `int` (the process exit status, truncated by the operating
   system). Use `args()` for command-line arguments.
+
+## Methods
+
+```
+fn (self: item) cost(price: int) -> int { return self.qty * price; }
+fn (var self: item) add(n: int) { self.qty = self.qty + n; }
+
+rope.add(2);
+print(rope.cost(4));
+```
+
+The receiver is written before the method name. Its name is any identifier;
+`self` is the convention used here. The receiver type must be a struct
+declared in the same module. `pub fn` makes the method visible to importers.
+`main` cannot be a method. A C import cannot declare one.
+
+`self` without `var` is an immutable borrow of the value. The method cannot
+assign to it or to its fields. `var self` is the caller's place: assigning
+`self.field` or `self` updates that place, and copy-on-write still applies
+when the value is shared with someone else. A `var` receiver is only legal
+when the call's receiver is a place rooted in a `var` (a variable, field, or
+element), the same rule as `push`. `item { qty: 1 }.add(1)` and `let x = ...;
+x.add(1)` are errors.
+
+This split keeps value semantics and the existing cost model. A method that
+returned an updated copy would copy the whole struct whenever the caller
+still held it. In-place mutation of a `var` does not. The `var` keyword on
+the receiver makes that mutation visible at the declaration, not hidden in
+the call.
+
+Methods are not first-class values. `item.cost` is not a function value.
+There is no inheritance and no method on `int`, `string`, arrays, or maps.
 
 ## Statements
 
@@ -110,6 +146,7 @@ statement = ("let" | "var") IDENT [ ":" type ] "=" expr ";"
           | place "=" expr ";"
           | "if" expr block [ "else" ( if_stmt | block ) ]
           | "while" expr block
+          | "for" IDENT "in" expr [ ".." [ "=" ] expr ] block
           | "return" [ expr ] ";"
           | "print" "(" [ expr { "," expr } ] ")" ";"
           | "break" ";" | "continue" ";"
@@ -133,17 +170,54 @@ place     = IDENT { "[" expr "]" | "." IDENT } .
   to right, then the right-hand side, then the store happens.
 - `if` and `while` conditions must be `bool`. Braces are required. A struct
   literal inside a condition must be wrapped in parentheses.
-- `break` and `continue` are only valid inside `while`.
+- `break` and `continue` are only valid inside `while` or `for`. They apply
+  to the innermost loop. `continue` in a `for` still advances the loop.
 - A function with a result type must end in a `return` on every path. The
   check is syntactic: the last statement must be a `return`, a block ending in
-  one, or an `if`/`else` chain whose branches all end in one. `while true` does
-  not count.
+  one, or an `if`/`else` chain whose branches all end in one. `while true` and
+  `for` do not count, because the body might not run.
 - Only function calls may be used as expression statements.
 - `print` writes its arguments separated by single spaces plus a newline.
-  Strings print raw at the top level and quoted inside arrays and structs.
-  Arrays print as `[1, 2]`, structs as `Point { x: 1.0, y: 2.0 }`. Floats print
-  in the shortest form that reads back as the same value, with `.0` added to
-  whole numbers. Standard output is line buffered.
+  It accepts every value type. Strings print raw at the top level and quoted
+  inside arrays, maps and structs. Arrays print as `[1, 2]`, maps as
+  `{"a": 1}` in the same order as `keys`, structs as `Point { x: 1.0, y: 2.0 }`.
+  Floats print in the shortest form that reads
+  back as the same value, with `.0` added to whole numbers. Standard output
+  is line buffered.
+
+### for
+
+```
+for i in 0..n { }     // i is 0, 1, ..., n-1
+for i in 0..=n { }    // i is 0, 1, ..., n
+for x in items { }    // x is each element of an array
+```
+
+- `..` excludes the end. `..=` includes it. Both count upward by 1. If the
+  start is already past the end (`start > end`, or `start == end` for `..`),
+  the body does not run. There is no downward range.
+- The two bounds are evaluated once, left to right, before the body. A range
+  is not an expression; `let x = 0..n` is an error that says to use `for`.
+- The loop variable is a new immutable binding in the body only. Assigning to
+  it is an error. It shadows an outer variable of the same name inside the
+  body, and it is not visible after the loop.
+- `for x in items` evaluates the array once and walks that value. `x` is a
+  copy of each element (value semantics). Pushing onto the original variable
+  during the loop does not change how many elements this loop visits, and it
+  does not change the copies already produced. The loop holds its own retain
+  of the array, so a later mutation copies instead of altering the walk.
+- The step after an inclusive end is not computed. `for i in max..=max`,
+  where `max` is the largest int, runs once and does not overflow.
+- `for k in map` walks the keys, in the same order as `keys`. The map
+  expression is evaluated once and retained, so deleting from the original
+  `var` during the loop does not change which keys this loop visits. The
+  loop variable is the key. Use `m[k]` for the value. Strings are not
+  walked.
+- `break` leaves the loop. `continue` abandons the rest of the body and
+  advances. A `while` nested inside `for` has its own `break` and `continue`.
+- A struct literal in the `for` header must be wrapped in parentheses, same
+  as in an `if` or `while` condition. `for x in [item { n: 1 }]` is fine
+  because the literal is inside the array.
 
 ## Expressions
 
@@ -179,7 +253,7 @@ User functions may shadow builtin names.
 
 | function | description |
 |----------|-------------|
-| `len(x)` | bytes in a string or elements in an array |
+| `len(x)` | bytes in a string, elements in an array, or entries in a map |
 | `str(x)` | int, float, bool or string to string |
 | `float(i: int) -> float` | conversion |
 | `int(f: float) -> int` | truncates toward zero; error for nan or out of range |
@@ -213,6 +287,11 @@ User functions may shadow builtin names.
 | `tcp_read(fd, max) -> string` | one read of at most `max` bytes (capped at 1 MiB). `""` on end of stream or error |
 | `tcp_write(fd, data) -> int` | bytes written, or `-1` |
 | `tcp_close(fd)` | close a socket. A bad descriptor is ignored |
+| `fmt(format, ...)` | replace each `{}` in a string. `{{` and `}}` are literal braces. A string literal is checked at compile time for hole syntax and argument count; a computed format is checked at run time and stops the program on a mismatch. Values must be int, float, bool or string, rendered the same way as `print`. Arrays, maps and structs are rejected (use `print`) |
+| `delete(place, key) -> bool` | remove `key` from a map held in a `var`. true if it was present. a missing key is left alone. same statement rule as `push` |
+| `has(m, key) -> bool` | true if the map contains `key` |
+| `keys(m) -> [K]` | the map's keys, in hash order |
+| `values(m) -> [V]` | the map's values, in the same order as `keys` |
 | `exit(code: int)` | flush standard output and exit immediately |
 | `assert(cond: bool, message: string)` | runtime error with the message if `cond` is false |
 
@@ -306,9 +385,10 @@ Windows is not.
 
 ## Not supported
 
-Generics, closures and first-class functions, methods, interfaces, enums,
-maps/dictionaries, tuples, optional or error types, exceptions, `for` loops,
-compound assignment (`+=`), global variables and constants, string indexing by
+Generics, closures and first-class functions, interfaces, enums,
+tuples, optional or error types, exceptions, compound
+assignment (`+=`), global variables and constants, string indexing by
 character, Unicode-aware string operations, deep equality on arrays and
-structs, concurrency, networking, directory operations, environment variables,
-Go package interop, and arbitrary C FFI.
+structs, concurrency, TLS, directory operations, environment variables, Go
+package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
+`{:.2}` and no `{0}`).

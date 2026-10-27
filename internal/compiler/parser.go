@@ -198,8 +198,21 @@ func (p *parser) parseFunc() *FuncDecl {
 }
 
 func (p *parser) parseSignature(start Pos, pub bool) *FuncDecl {
+	decl := &FuncDecl{Pos: start, Pub: pub}
+	if p.at(LParen) {
+		p.next()
+		if p.at(KwVar) {
+			decl.RecvMutable = true
+			p.next()
+		}
+		rn := p.expectIdent("for the receiver name, as in fn (self: item) name")
+		p.expect(Colon, "after the receiver name")
+		decl.Recv = &Param{Pos: rn.Pos, Name: rn.Text, Type: p.parseType()}
+		p.expect(RParen, "after the receiver")
+	}
 	name := p.expectIdent("for function name")
-	decl := &FuncDecl{Pos: start, NamePos: name.Pos, Pub: pub, Name: name.Text}
+	decl.Name = name.Text
+	decl.NamePos = name.Pos
 	p.expect(LParen, "after function name")
 	for !p.at(RParen) {
 		pn := p.expectIdent("for parameter name")
@@ -227,6 +240,14 @@ func (p *parser) parseType() *TypeExpr {
 		p.expect(RBracket, "to close array type")
 		return &TypeExpr{Pos: lb.Pos, Elem: elem}
 	}
+	if p.at(LBrace) {
+		lb := p.next()
+		key := p.parseType()
+		p.expect(Colon, "in map type")
+		val := p.parseType()
+		p.expect(RBrace, "to close map type")
+		return &TypeExpr{Pos: lb.Pos, Key: key, Elem: val}
+	}
 	t := p.expectIdent("for type")
 	te := &TypeExpr{Pos: t.Pos, Name: t.Text}
 	if p.at(Dot) {
@@ -235,6 +256,32 @@ func (p *parser) parseType() *TypeExpr {
 		te.Module, te.Name = t.Text, n.Text
 	}
 	return te
+}
+
+func (p *parser) parseMapLit(pos Pos) *MapLit {
+	p.enter()
+	defer p.leave()
+	p.next()
+	lit := &MapLit{Pos: pos}
+	if p.at(RBrace) {
+		p.next()
+		return lit
+	}
+	for {
+		key := p.parseExpr()
+		p.expect(Colon, "between map key and value")
+		val := p.parseExpr()
+		lit.Entries = append(lit.Entries, MapEntry{Key: key, Value: val})
+		if !p.at(Comma) {
+			break
+		}
+		p.next()
+		if p.at(RBrace) {
+			break
+		}
+	}
+	p.expect(RBrace, "to close map literal")
+	return lit
 }
 
 func (p *parser) parseBlock() *Block {
@@ -260,6 +307,7 @@ func (p *parser) parseCond() Expr {
 	p.noStruct = true
 	x := p.parseExpr()
 	p.noStruct = saved
+	p.rejectRange()
 	if p.at(LBrace) && p.peekKind(1) == IdentTok && p.peekKind(2) == Colon {
 		p.fail(p.tok().Pos, "struct literals in if and while conditions must be wrapped in parentheses")
 	}
@@ -291,6 +339,7 @@ func (p *parser) parseStmt() Stmt {
 		}
 		p.expect(Assign, "in variable declaration (variables must be initialized)")
 		s.Value = p.parseExpr()
+		p.rejectRange()
 		p.expect(Semicolon, "after variable declaration")
 		return s
 	case KwIf:
@@ -299,6 +348,8 @@ func (p *parser) parseStmt() Stmt {
 		p.next()
 		cond := p.parseCond()
 		return &WhileStmt{Pos: t.Pos, Cond: cond, Body: p.parseBlock()}
+	case KwFor:
+		return p.parseFor()
 	case KwReturn:
 		p.next()
 		s := &ReturnStmt{Pos: t.Pos}
@@ -325,6 +376,7 @@ func (p *parser) parseStmt() Stmt {
 		return &BlockStmt{Block: p.parseBlock()}
 	}
 	x := p.parseExpr()
+	p.rejectRange()
 	if p.at(Assign) {
 		if !isPlace(x) {
 			p.fail(p.tok().Pos, "cannot assign to this expression (only variables, struct fields and array elements can be assigned)")
@@ -339,6 +391,50 @@ func (p *parser) parseStmt() Stmt {
 	}
 	p.expect(Semicolon, "after expression statement")
 	return &ExprStmt{Pos: t.Pos, X: x}
+}
+
+func (p *parser) sawRange() bool {
+	return p.at(Dot) && p.peekKind(1) == Dot
+}
+
+func (p *parser) rejectRange() {
+	if p.sawRange() {
+		p.fail(p.tok().Pos, "a range is only allowed in for (for i in start..end or for i in start..=end)")
+	}
+}
+
+func (p *parser) parseFor() *ForStmt {
+	p.enter()
+	defer p.leave()
+	t := p.next()
+	name := p.expectIdent("after for")
+	p.expect(KwIn, "after the loop variable (for x in ...)")
+	s := &ForStmt{Pos: t.Pos, Name: name.Text, NamePos: name.Pos}
+	// The '{' of the body would otherwise be read as a struct literal.
+	saved := p.noStruct
+	p.noStruct = true
+	start := p.parseExpr()
+	if p.sawRange() {
+		p.next()
+		p.next()
+		s.Kind = ForRange
+		if p.at(Assign) {
+			p.next()
+			s.Kind = ForInclusive
+		}
+		s.Start = start
+		s.End = p.parseExpr()
+		p.rejectRange()
+	} else {
+		s.Kind = ForArray
+		s.Seq = start
+	}
+	p.noStruct = saved
+	if p.at(LBrace) && p.peekKind(1) == IdentTok && p.peekKind(2) == Colon {
+		p.fail(p.tok().Pos, "struct literals in for must be wrapped in parentheses")
+	}
+	s.Body = p.parseBlock()
+	return s
 }
 
 func (p *parser) parseIf() Stmt {
@@ -362,6 +458,7 @@ func (p *parser) parseList(end Kind, context string) []Expr {
 	p.withStructLits(func() {
 		for !p.at(end) {
 			list = append(list, p.parseExpr())
+			p.rejectRange()
 			if !p.at(Comma) {
 				break
 			}
@@ -430,6 +527,9 @@ func (p *parser) parsePostfix() Expr {
 	for {
 		switch p.tok().Kind {
 		case Dot:
+			if p.peekKind(1) == Dot {
+				return x
+			}
 			p.next()
 			name := p.expectIdent("after \".\"")
 			x = &SelectorExpr{X: x, Name: name.Text, NamePos: name.Pos}
@@ -523,6 +623,8 @@ func (p *parser) parsePrimary() Expr {
 	case LBracket:
 		p.next()
 		return &ArrayLit{Pos: t.Pos, Elems: p.parseList(RBracket, "to close array literal")}
+	case LBrace:
+		return p.parseMapLit(t.Pos)
 	}
 	p.fail(t.Pos, "expected expression, found %s", t.describe())
 	return nil

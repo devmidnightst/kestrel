@@ -93,7 +93,7 @@ func cType(t Type) string {
 		return "bool"
 	case KFloat:
 		return "double"
-	case KString, KArray, KStruct:
+	case KString, KArray, KMap, KStruct:
 		return "ks_obj *"
 	}
 	return "void"
@@ -105,10 +105,18 @@ func zeroValue(t Type) string {
 		return "false"
 	case KFloat:
 		return "0.0"
-	case KString, KArray, KStruct:
+	case KString, KArray, KMap, KStruct:
 		return "NULL"
 	}
 	return "0"
+}
+
+func mapKind(t Type) string {
+	k := "i64"
+	if t.Key == StringType {
+		k = "str"
+	}
+	return k + "_" + arrKind(t.Elem)
 }
 
 func arrKind(elem Type) string {
@@ -186,7 +194,7 @@ func printScalar(t Type, x string, quoted bool) string {
 }
 
 func (g *gen) printValue(t Type, x string, quoted bool) string {
-	if t.Kind == KArray || t.Kind == KStruct {
+	if t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct {
 		return fmt.Sprintf("%s(%s);", g.printFn(t), x)
 	}
 	return printScalar(t, x, quoted)
@@ -206,6 +214,12 @@ func (g *gen) printFn(t Type) string {
 		fmt.Fprintf(&sb, "\tks_arr_%s *a = (ks_arr_%s *)v;\n\tputchar('[');\n", k, k)
 		sb.WriteString("\tfor (int64_t i = 0; i < a->len; i++) {\n\t\tif (i > 0) fputs(\", \", stdout);\n")
 		fmt.Fprintf(&sb, "\t\t%s\n\t}\n\tputchar(']');\n", g.printValue(t.Elem, "a->data[i]", true))
+	} else if t.Kind == KMap {
+		k := mapKind(t)
+		fmt.Fprintf(&sb, "\tks_map_%s *m = (ks_map_%s *)v;\n\tputchar('{');\n", k, k)
+		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->cap; i++) {\n\t\tif (m->used[i] != 1) continue;\n\t\tif (shown++ > 0) fputs(\", \", stdout);\n")
+		fmt.Fprintf(&sb, "\t\t%s\n\t\tfputs(\": \", stdout);\n\t\t%s\n", g.printValue(t.Key, "m->keys[i]", true), g.printValue(t.Elem, "m->vals[i]", true))
+		sb.WriteString("\t}\n\tputchar('}');\n")
 	} else {
 		si := t.Struct
 		fmt.Fprintf(&sb, "\t%s *s = (%s *)v;\n\t(void)s;\n", si.CName, si.CName)
@@ -229,9 +243,16 @@ func (g *gen) printFn(t Type) string {
 }
 
 func prototype(fn *Func) string {
-	params := make([]string, len(fn.Params))
-	for i, p := range fn.Params {
-		params[i] = fmt.Sprintf("%s %s", cType(p.Type), p.CName)
+	params := []string{}
+	if fn.Recv != nil {
+		if fn.Recv.Slot {
+			params = append(params, "ks_obj **"+fn.Recv.CName)
+		} else {
+			params = append(params, fmt.Sprintf("%s %s", cType(fn.Recv.Type), fn.Recv.CName))
+		}
+	}
+	for _, p := range fn.Params {
+		params = append(params, fmt.Sprintf("%s %s", cType(p.Type), p.CName))
 	}
 	if len(params) == 0 {
 		params = []string{"void"}

@@ -42,10 +42,13 @@ type TypeExpr struct {
 	Name   string
 	Module string
 	Elem   *TypeExpr
+	Key    *TypeExpr
 }
 
 func (t *TypeExpr) String() string {
 	switch {
+	case t.Key != nil:
+		return "{" + t.Key.String() + ": " + t.Elem.String() + "}"
 	case t.Elem != nil:
 		return "[" + t.Elem.String() + "]"
 	case t.Module != "":
@@ -75,14 +78,16 @@ type Param struct {
 }
 
 type FuncDecl struct {
-	Pos     Pos
-	NamePos Pos
-	Pub     bool
-	Name    string
-	Params  []*Param
-	Result  *TypeExpr
-	Body    *Block
-	Header  string
+	Pos         Pos
+	NamePos     Pos
+	Pub         bool
+	Name        string
+	Recv        *Param
+	RecvMutable bool
+	Params      []*Param
+	Result      *TypeExpr
+	Body        *Block
+	Header      string
 }
 
 type Block struct {
@@ -117,6 +122,27 @@ type WhileStmt struct {
 	Pos  Pos
 	Cond Expr
 	Body *Block
+}
+
+type ForKind int
+
+const (
+	ForRange ForKind = iota
+	ForInclusive
+	ForArray
+)
+
+// ForStmt is `for name in start..end`, `for name in start..=end`, or
+// `for name in array`. The name is in scope only in the body.
+type ForStmt struct {
+	Pos     Pos
+	Name    string
+	NamePos Pos
+	Kind    ForKind
+	Start   Expr
+	End     Expr
+	Seq     Expr
+	Body    *Block
 }
 
 type ReturnStmt struct {
@@ -208,6 +234,16 @@ type ArrayLit struct {
 	Elems []Expr
 }
 
+type MapLit struct {
+	Pos     Pos
+	Entries []MapEntry
+}
+
+type MapEntry struct {
+	Key   Expr
+	Value Expr
+}
+
 type StructLit struct {
 	Pos    Pos
 	Module string
@@ -226,6 +262,7 @@ func (s *LetStmt) P() Pos      { return s.Pos }
 func (s *AssignStmt) P() Pos   { return s.Pos }
 func (s *IfStmt) P() Pos       { return s.Pos }
 func (s *WhileStmt) P() Pos    { return s.Pos }
+func (s *ForStmt) P() Pos      { return s.Pos }
 func (s *ReturnStmt) P() Pos   { return s.Pos }
 func (s *PrintStmt) P() Pos    { return s.Pos }
 func (s *ExprStmt) P() Pos     { return s.Pos }
@@ -243,12 +280,14 @@ func (e *CallExpr) P() Pos     { return e.Pos }
 func (e *SelectorExpr) P() Pos { return e.X.P() }
 func (e *IndexExpr) P() Pos    { return e.X.P() }
 func (e *ArrayLit) P() Pos     { return e.Pos }
+func (e *MapLit) P() Pos       { return e.Pos }
 func (e *StructLit) P() Pos    { return e.Pos }
 
 func (*LetStmt) stmtNode()      {}
 func (*AssignStmt) stmtNode()   {}
 func (*IfStmt) stmtNode()       {}
 func (*WhileStmt) stmtNode()    {}
+func (*ForStmt) stmtNode()      {}
 func (*ReturnStmt) stmtNode()   {}
 func (*PrintStmt) stmtNode()    {}
 func (*ExprStmt) stmtNode()     {}
@@ -267,4 +306,5 @@ func (*CallExpr) exprNode()     {}
 func (*SelectorExpr) exprNode() {}
 func (*IndexExpr) exprNode()    {}
 func (*ArrayLit) exprNode()     {}
+func (*MapLit) exprNode()       {}
 func (*StructLit) exprNode()    {}

@@ -55,12 +55,12 @@ func TestLexTokensAndPositions(t *testing.T) {
 }
 
 func TestLexKeywords(t *testing.T) {
-	src := "fn pub let var if else while return print true false import as break continue ifx"
+	src := "fn pub let var if else while for in return print true false import as break continue ifx"
 	toks, err := Lex("k.ks", []byte(src))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Kind{KwFn, KwPub, KwLet, KwVar, KwIf, KwElse, KwWhile, KwReturn, KwPrint, KwTrue, KwFalse, KwImport, KwAs, KwBreak, KwContinue, IdentTok, EOF}
+	want := []Kind{KwFn, KwPub, KwLet, KwVar, KwIf, KwElse, KwWhile, KwFor, KwIn, KwReturn, KwPrint, KwTrue, KwFalse, KwImport, KwAs, KwBreak, KwContinue, IdentTok, EOF}
 	for i, k := range want {
 		if toks[i].Kind != k {
 			t.Errorf("token %d: got %v, want %v", i, toks[i].Kind, k)

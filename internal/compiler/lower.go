@@ -8,6 +8,7 @@ import (
 type genScope struct {
 	vars []string
 	loop bool
+	cont string
 }
 
 type fnGen struct {
@@ -58,6 +59,9 @@ func (f *fnGen) function(fn *Func) {
 	fmt.Fprintf(f.out, "\nstatic %s {\n", prototype(fn))
 	f.ind = 1
 	f.line("ks_stack_check();")
+	if fn.Recv != nil {
+		f.line("(void)%s;", fn.Recv.CName)
+	}
 	for _, p := range fn.Params {
 		f.line("(void)%s;", p.CName)
 	}
@@ -70,8 +74,15 @@ func (f *fnGen) function(fn *Func) {
 }
 
 func (f *fnGen) block(b *Block, loop bool) {
-	s := &genScope{loop: loop}
+	f.blockGo(b, loop, "", nil)
+}
+
+func (f *fnGen) blockGo(b *Block, loop bool, cont string, init func(*genScope)) {
+	s := &genScope{loop: loop, cont: cont}
 	f.scopes = append(f.scopes, s)
+	if init != nil {
+		init(s)
+	}
 	for _, st := range b.Stmts {
 		f.stmt(st)
 	}
@@ -157,6 +168,8 @@ func (f *fnGen) stmt(s Stmt) {
 		f.block(s.Body, true)
 		f.ind--
 		f.line("}")
+	case *ForStmt:
+		f.forStmt(s)
 	case *ReturnStmt:
 		f.open()
 		if s.Value == nil {
@@ -178,7 +191,11 @@ func (f *fnGen) stmt(s Stmt) {
 		f.line("break;")
 	case *ContinueStmt:
 		f.releaseToLoop()
-		f.line("continue;")
+		if lab := f.continueLabel(); lab != "" {
+			f.line("goto %s;", lab)
+		} else {
+			f.line("continue;")
+		}
 	case *BlockStmt:
 		f.line("{")
 		f.ind++
@@ -188,6 +205,124 @@ func (f *fnGen) stmt(s Stmt) {
 	default:
 		panic(fmt.Sprintf("unexpected statement %T", s))
 	}
+}
+
+func (f *fnGen) continueLabel() string {
+	for i := len(f.scopes) - 1; i >= 0; i-- {
+		if f.scopes[i].loop {
+			return f.scopes[i].cont
+		}
+	}
+	return ""
+}
+
+func (f *fnGen) label(prefix string) string {
+	f.ntmp++
+	return fmt.Sprintf("%s%d", prefix, f.ntmp)
+}
+
+// evalKept evaluates e and keeps a scalar copy after temporary values are released.
+func (f *fnGen) evalKept(e Expr) string {
+	f.pushFrame()
+	v := f.temp(cType(f.g.info.Types[e]), f.eval(e))
+	f.popFrame()
+	return v
+}
+
+// evalOwnedKept evaluates e as an owned object that the caller releases.
+func (f *fnGen) evalOwnedKept(e Expr) string {
+	f.pushFrame()
+	v := f.temp("ks_obj *", f.evalOwned(e))
+	f.popFrame()
+	return v
+}
+
+func (f *fnGen) forMap(s *ForStmt, outer *genScope, lab string) {
+	info := f.g.info
+	mp := f.evalOwnedKept(s.Seq)
+	outer.vars = append(outer.vars, mp)
+	mt := info.Types[s.Seq]
+	kind := mapKind(mt)
+	m := f.temp("ks_map_"+kind+" *", fmt.Sprintf("(ks_map_%s *)%s", kind, mp))
+	idx := f.temp("int64_t", "0")
+	f.line("while (1) {")
+	f.ind++
+	f.line("while (%s < %s->cap && %s->used[%s] != 1) %s++;", idx, m, m, idx, idx)
+	f.line("if (!(%s < %s->cap)) break;", idx, m)
+	f.blockGo(s.Body, true, lab, func(sc *genScope) {
+		v := info.Loops[s]
+		get := fmt.Sprintf("%s->keys[%s]", m, idx)
+		if v.Type.Managed() {
+			f.line("%s %s = ks_retain(%s);", cType(v.Type), v.CName, get)
+			sc.vars = append(sc.vars, v.CName)
+		} else {
+			f.line("%s %s = %s;", cType(v.Type), v.CName, get)
+		}
+	})
+	f.line("%s:", lab)
+	f.line("%s = ks_add(%s, 1);", idx, idx)
+	f.ind--
+	f.line("}")
+}
+
+func (f *fnGen) forStmt(s *ForStmt) {
+	info := f.g.info
+	f.line("{")
+	f.ind++
+	outer := &genScope{}
+	f.scopes = append(f.scopes, outer)
+	lab := f.label("ks_fc")
+	if s.Kind == ForArray && info.Types[s.Seq].Kind == KMap {
+		f.forMap(s, outer, lab)
+	} else if s.Kind == ForArray {
+		arr := f.evalOwnedKept(s.Seq)
+		outer.vars = append(outer.vars, arr)
+		elem := info.Types[s.Seq].Elem
+		k := arrKind(elem)
+		n := f.temp("int64_t", fmt.Sprintf("ks_arr_%s_len(%s)", k, arr))
+		idx := f.temp("int64_t", "0")
+		f.line("while (1) {")
+		f.ind++
+		f.line("if (!(%s < %s)) break;", idx, n)
+		f.blockGo(s.Body, true, lab, func(sc *genScope) {
+			v := info.Loops[s]
+			get := fmt.Sprintf("ks_arr_%s_get(%s, %s)", k, arr, idx)
+			if v.Type.Managed() {
+				f.line("%s %s = ks_retain(%s);", cType(v.Type), v.CName, get)
+				sc.vars = append(sc.vars, v.CName)
+			} else {
+				f.line("%s %s = %s;", cType(v.Type), v.CName, get)
+			}
+		})
+		f.line("%s:", lab)
+		f.line("%s = ks_add(%s, 1);", idx, idx)
+		f.ind--
+		f.line("}")
+	} else {
+		start := f.evalKept(s.Start)
+		end := f.evalKept(s.End)
+		v := info.Loops[s]
+		f.line("int64_t %s = %s;", v.CName, start)
+		op := "<"
+		if s.Kind == ForInclusive {
+			op = "<="
+		}
+		f.line("while (1) {")
+		f.ind++
+		f.line("if (!(%s %s %s)) break;", v.CName, op, end)
+		f.blockGo(s.Body, true, lab, nil)
+		f.line("%s:", lab)
+		if s.Kind == ForInclusive {
+			f.line("if (%s == %s) break;", v.CName, end)
+		}
+		f.line("%s = ks_add(%s, 1);", v.CName, v.CName)
+		f.ind--
+		f.line("}")
+	}
+	f.releaseScope(outer)
+	f.scopes = f.scopes[:len(f.scopes)-1]
+	f.ind--
+	f.line("}")
 }
 
 func (f *fnGen) condition(e Expr) string {
@@ -271,7 +406,11 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 	case *StringLit:
 		return "(&" + f.g.literal(e.Value) + ".h)", false
 	case *Ident:
-		return info.Uses[e].CName, false
+		v := info.Uses[e]
+		if v.Slot {
+			return "(*" + v.CName + ")", false
+		}
+		return v.CName, false
 	case *UnaryExpr:
 		x := f.eval(e.X)
 		switch {
@@ -284,8 +423,12 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 	case *BinaryExpr:
 		return f.binary(e, t)
 	case *IndexExpr:
+		baseT := info.Types[e.X]
 		a := f.eval(e.X)
 		i := f.eval(e.Index)
+		if baseT.Kind == KMap {
+			return f.temp(cType(t), fmt.Sprintf("ks_map_%s_get(%s, %s)", mapKind(baseT), a, i)), false
+		}
 		return f.temp(cType(t), fmt.Sprintf("ks_arr_%s_get(%s, %s)", arrKind(t), a, i)), false
 	case *SelectorExpr:
 		s := f.eval(e.X)
@@ -299,6 +442,15 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 			f.line("ks_arr_%s_push(%s, %s);", k, arr, v)
 		}
 		return arr, true
+	case *MapLit:
+		k := mapKind(t)
+		m := f.temp("ks_obj *", fmt.Sprintf("ks_map_%s_new(%d)", k, len(e.Entries)))
+		for _, en := range e.Entries {
+			kk := f.eval(en.Key)
+			vv := f.evalOwnedTemp(en.Value)
+			f.line("ks_map_%s_set(%s, %s, %s);", k, m, kk, vv)
+		}
+		return m, true
 	case *StructLit:
 		si := info.Literals[e]
 		vals := map[string]string{}
@@ -315,6 +467,9 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 			return f.builtin(e, name, t)
 		}
 		fn := info.Calls[e]
+		if fn.Recv != nil {
+			return f.methodCall(e, fn)
+		}
 		args := make([]string, len(e.Args))
 		for i, a := range e.Args {
 			args[i] = f.eval(a)
@@ -389,7 +544,8 @@ func (f *fnGen) prepPlace(target Expr) (*Var, []placeStep) {
 			}
 			for i := range steps {
 				if ix, ok := steps[i].expr.(*IndexExpr); ok {
-					steps[i].idx = f.temp("int64_t", f.eval(ix.Index))
+					it := f.g.info.Types[ix.Index]
+					steps[i].idx = f.temp(cType(it), f.eval(ix.Index))
 				}
 			}
 			return f.g.info.Uses[e], steps
@@ -408,12 +564,20 @@ func (f *fnGen) prepPlace(target Expr) (*Var, []placeStep) {
 func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
 	info := f.g.info
 	ptr := "&" + root.CName
+	if root.Slot {
+		ptr = root.CName
+	}
 	for _, st := range steps {
 		switch e := st.expr.(type) {
 		case *IndexExpr:
 			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
 			elem := info.Types[e]
-			ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_arr_%s_slot(%s, %s)", arrKind(elem), u, st.idx))
+			baseT := info.Types[e.X]
+			if baseT.Kind == KMap {
+				ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_map_%s_slot(%s, %s)", mapKind(baseT), u, st.idx))
+			} else {
+				ptr = f.temp(cType(elem)+"*", fmt.Sprintf("ks_arr_%s_slot(%s, %s)", arrKind(elem), u, st.idx))
+			}
 		case *SelectorExpr:
 			u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
 			si := info.Types[e.X].Struct
@@ -424,6 +588,16 @@ func (f *fnGen) walkPlace(root *Var, steps []placeStep) string {
 }
 
 func (f *fnGen) assign(s *AssignStmt) {
+	if ix, ok := s.Target.(*IndexExpr); ok && f.g.info.Types[ix.X] != nil && f.g.info.Types[ix.X].Kind == KMap {
+		key := f.eval(ix.Index)
+		val := f.evalOwnedTemp(s.Value)
+		root, steps := f.prepPlace(ix.X)
+		ptr := f.walkPlace(root, steps)
+		mt := f.g.info.Types[ix.X]
+		u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+		f.line("ks_map_%s_set(%s, %s, %s);", mapKind(mt), u, key, val)
+		return
+	}
 	root, steps := f.prepPlace(s.Target)
 	t := f.g.info.Types[s.Target]
 	rv := f.evalOwnedTemp(s.Value)
@@ -434,9 +608,72 @@ func (f *fnGen) assign(s *AssignStmt) {
 	f.line("*%s = %s;", ptr, rv)
 }
 
+func (f *fnGen) methodCall(e *CallExpr, fn *Func) (string, bool) {
+	sel := e.Fn.(*SelectorExpr)
+	var recv string
+	if fn.RecvMutable {
+		root, steps := f.prepPlace(sel.X)
+		recv = f.walkPlace(root, steps)
+	} else {
+		recv = f.eval(sel.X)
+	}
+	args := make([]string, 0, len(e.Args)+1)
+	args = append(args, recv)
+	for _, a := range e.Args {
+		args = append(args, f.eval(a))
+	}
+	call := fmt.Sprintf("%s(%s)", fn.CName, strings.Join(args, ", "))
+	if fn.Result == Void {
+		f.line("%s;", call)
+		return "", false
+	}
+	return f.temp(cType(fn.Result), call), fn.Result.Managed()
+}
+
+func (f *fnGen) stringify(e Expr) string {
+	switch f.g.info.Types[e].Kind {
+	case KInt:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_int(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	case KFloat:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_float(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	case KBool:
+		s := f.temp("ks_obj *", fmt.Sprintf("ks_str_bool(%s)", f.eval(e)))
+		f.releaseLater(s)
+		return s
+	default:
+		return f.eval(e)
+	}
+}
+
+func (f *fnGen) fmtCall(e *CallExpr) (string, bool) {
+	format := f.eval(e.Args[0])
+	parts := make([]string, len(e.Args)-1)
+	for i, a := range e.Args[1:] {
+		parts[i] = f.stringify(a)
+	}
+	call := fmt.Sprintf("ks_fmt(%s, 0, NULL)", format)
+	if len(parts) > 0 {
+		call = fmt.Sprintf("ks_fmt(%s, %d, (ks_obj *[]){%s})", format, len(parts), strings.Join(parts, ", "))
+	}
+	return f.temp("ks_obj *", call), true
+}
+
 func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 	info := f.g.info
 	switch name {
+	case "fmt":
+		return f.fmtCall(e)
+	case "delete":
+		root, steps := f.prepPlace(e.Args[0])
+		key := f.eval(e.Args[1])
+		ptr := f.walkPlace(root, steps)
+		mt := info.Types[e.Args[0]]
+		u := f.temp("ks_obj *", fmt.Sprintf("ks_unique(%s)", ptr))
+		return f.temp("bool", fmt.Sprintf("ks_map_%s_delete(%s, %s)", mapKind(mt), u, key)), false
 	case "push":
 		root, steps := f.prepPlace(e.Args[0])
 		arrT := info.Types[e.Args[0]]
@@ -469,6 +706,9 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 		if argT == StringType {
 			return f.temp("int64_t", call("ks_str_len")), false
 		}
+		if argT.Kind == KMap {
+			return f.temp("int64_t", call("ks_map_"+mapKind(argT)+"_len")), false
+		}
 		return f.temp("int64_t", call("ks_arr_"+arrKind(argT.Elem)+"_len")), false
 	case "str":
 		switch argT.Kind {
@@ -493,6 +733,12 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 		return f.temp(cType(t), call("ks_"+name+suffix)), false
 	case "slice":
 		return f.temp("ks_obj *", call("ks_arr_"+arrKind(t.Elem)+"_slice")), true
+	case "has":
+		return f.temp("bool", call("ks_map_"+mapKind(argT)+"_has")), false
+	case "keys":
+		return f.temp("ks_obj *", call("ks_map_"+mapKind(argT)+"_keys")), true
+	case "values":
+		return f.temp("ks_obj *", call("ks_map_"+mapKind(argT)+"_values")), true
 	}
 	sig := fixedBuiltins[name]
 	if sig.result == Void {

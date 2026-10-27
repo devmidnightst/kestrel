@@ -53,6 +53,20 @@ type featureCase struct {
 }
 
 var featureCases = []featureCase{
+	{"string map", `fn main() {
+    var m: {string: int} = {};
+    m["a"] = 1;
+    m["b"] = 2;
+    m["a"] = 3;
+    var copy = m;
+    copy["a"] = 9;
+    print(m["a"], m["b"], copy["a"], has(m, "b"), has(m, "missing"), len(m));
+}`, "3 2 9 true false 2\n"},
+	{"int map", `fn main() {
+    var m = { 1: "one", 2: "two" };
+    m[2] = "TWO";
+    print(m[1], m[2], len(m), len(keys(m)), len(values(m)));
+}`, "one TWO 2 2 2\n"},
 	{"array basics", `fn main() {
     var a = [1, 2, 3];
     push(a, 4);
@@ -173,6 +187,120 @@ fn main() {
 fn main() {
     print(pick(["a", "b", "c"], "b"), pick([], "z"));
 }`, "found b none\n"},
+	{"for range", `fn main() {
+    var s = 0;
+    for i in 0..5 { s = s + i; }
+    var t = 0;
+    for i in 1..=4 {
+        if i == 2 { continue; }
+        if i == 4 { break; }
+        t = t + i;
+    }
+    var neg = 0;
+    for i in -2..2 { neg = neg + i; }
+    var one = 0;
+    for i in 3..=3 { one = one + 1; }
+    var none = 0;
+    for i in 5..5 { none = none + 1; }
+    for i in 4..2 { none = none + 1; }
+    for i in 9223372036854775807..=9223372036854775807 { one = one + 1; }
+    print(s, t, neg, one, none);
+}`, "10 4 -2 2 0\n"},
+	{"for array", `struct box { n: int }
+fn main() {
+    var words = ["go", "to", "the"];
+    var n = 0;
+    for w in words {
+        if w == "to" { continue; }
+        n = n + len(w);
+    }
+    var nums = [1, 2];
+    var extra = 0;
+    for x in nums {
+        push(nums, x);
+        extra = extra + x;
+    }
+    var boxes = [box { n: 7 }];
+    var seen = 0;
+    for b in boxes {
+        var c = b;
+        c.n = 1;
+        seen = seen + b.n;
+    }
+    var empty: [int] = [];
+    var hits = 0;
+    for x in empty { hits = hits + x; }
+    var acc = 0;
+    for i in 0..3 {
+        var j = 0;
+        while j < 2 {
+            j = j + 1;
+            if j == 1 { continue; }
+        }
+        acc = acc + i;
+    }
+    print(n, extra, len(nums), seen, boxes[0].n, hits, acc);
+}`, "5 3 4 7 7 0 3\n"},
+	{"for return", `fn first(xs: [string]) -> string {
+    for s in xs {
+        if len(s) > 0 { return s; }
+    }
+    return "";
+}
+fn main() {
+    print(first(["", "ab", "c"]));
+}`, "ab\n"},
+	{"map delete and for", `fn main() {
+    var m: {string: int} = {};
+    m["a"] = 1;
+    m["b"] = 2;
+    m["c"] = 3;
+    var copy = m;
+    let removed = delete(m, "b");
+    let again = delete(m, "b");
+    print(removed, again, has(copy, "b"), has(m, "b"), len(m));
+    m["b"] = 9;
+    var sum = 0;
+    var n = 0;
+    for k in m {
+        sum = sum + m[k];
+        n = n + 1;
+        delete(m, k);
+    }
+    print(sum, n, len(m), len(copy));
+    var nums = { 1: "one", 2: "two" };
+    var seen = 0;
+    for k in nums { seen = seen + k; }
+    print(seen);
+}`, "true false true false 2\n13 3 0 3\n3\n"},
+	{"methods", `struct item { name: string, qty: int }
+struct box { it: item }
+fn (self: item) cost(price: int) -> int { return self.qty * price; }
+fn (self: item) label() -> string { return self.name; }
+fn (var self: item) add(n: int) { self.qty = self.qty + n; }
+fn main() {
+    var rope = item { name: "rope", qty: 3 };
+    let before = rope;
+    rope.add(2);
+    var b = box { it: item { name: "lamp", qty: 1 } };
+    b.it.add(9);
+    print(before.cost(4), rope.cost(4), before.qty, rope.qty, b.it.qty, rope.label());
+}`, "12 20 3 5 10 rope\n"},
+	{"fmt and print", `struct pair { a: int, b: string }
+fn main() {
+    print(fmt("{} is {}", "kestrel", 2026));
+    print(fmt("braces {{ }} and {}", true));
+    print(fmt("pi {}", 3.5));
+    print(fmt("none"));
+    print(fmt("{}", "a{b}"));
+    print(fmt("{{{}}}", 7));
+    var pat = "x{}";
+    print(fmt(pat, false));
+    var m: {string: int} = {};
+    m["a"] = 1;
+    var empty: {int: int} = {};
+    print(1, [1, 2], pair { a: 1, b: "x" }, m, empty);
+}`, "kestrel is 2026\nbraces { } and true\npi 3.5\nnone\na{b}\n{7}\nxfalse\n1 [1, 2] pair { a: 1, b: \"x\" } {\"a\": 1} {}\n"},
 }
 
 func TestFeatures(t *testing.T) {
@@ -184,6 +312,26 @@ func TestFeatures(t *testing.T) {
 				t.Errorf("exit %d, stderr %q\ngot:\n%s\nwant:\n%s", r.code, r.stderr, r.stdout, c.want)
 			}
 		})
+	}
+}
+
+func TestMethodAcrossModules(t *testing.T) {
+	requireCC(t)
+	dir := writeFiles(t, map[string]string{
+		"main.ks": "import \"item.ks\";\nfn main() {\n    var it = item.item { qty: 2 };\n    it.add(3);\n    print(it.cost(4));\n}\n",
+		"item.ks": "pub struct item { qty: int }\npub fn (self: item) cost(price: int) -> int { return self.qty * price; }\npub fn (var self: item) add(n: int) { self.qty = self.qty + n; }\n",
+	})
+	out, errOut, code := buildAndRun(t, filepath.Join(dir, "main.ks"))
+	if code != 0 || out != "20\n" {
+		t.Fatalf("exit %d, stderr %q, stdout %q", code, errOut, out)
+	}
+	hidden := writeFiles(t, map[string]string{
+		"main.ks": "import \"item.ks\";\nfn main() { let it = item.item { qty: 1 }; it.secret(); }\n",
+		"item.ks": "pub struct item { qty: int }\nfn (self: item) secret() {}\n",
+	})
+	_, err := Load(filepath.Join(hidden, "main.ks"))
+	if err == nil || !strings.Contains(err.Error(), "method item.secret is not public") {
+		t.Fatalf("private method: %v", err)
 	}
 }
 

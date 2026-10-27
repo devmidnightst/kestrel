@@ -56,6 +56,7 @@ func Check(modules []*Module, entry *Module) (*Program, error) {
 			Types:    map[Expr]Type{},
 			Uses:     map[*Ident]*Var{},
 			Defs:     map[*LetStmt]*Var{},
+			Loops:    map[*ForStmt]*Var{},
 			Calls:    map[*CallExpr]*Func{},
 			Builtins: map[*CallExpr]string{},
 			Fields:   map[*SelectorExpr]*Field{},
@@ -107,6 +108,15 @@ func (c *checker) errorf(pos Pos, format string, args ...any) {
 func (c *checker) resolveType(m *Module, t *TypeExpr) Type {
 	if t == nil {
 		return Void
+	}
+	if t.Key != nil {
+		key := c.resolveType(m, t.Key)
+		val := c.resolveType(m, t.Elem)
+		if key != Invalid && key != StringType && key != IntType {
+			c.errorf(t.Pos, "map keys must be string or int, not %s", key)
+			return Invalid
+		}
+		return MapOf(key, val)
 	}
 	if t.Elem != nil {
 		return ArrayOf(c.resolveType(m, t.Elem))
@@ -216,6 +226,10 @@ func (c *checker) collectFuncs(m *Module) {
 	}
 	for _, ci := range m.File.CImports {
 		for _, d := range ci.Externs {
+			if d.Recv != nil {
+				c.errorf(d.Pos, "c functions cannot be methods")
+				continue
+			}
 			fn := c.signature(m, d)
 			fn.Extern = true
 			fn.CName = d.Name
@@ -241,10 +255,46 @@ func (c *checker) collectFuncs(m *Module) {
 	}
 	for _, d := range m.File.Funcs {
 		fn := c.signature(m, d)
-		fn.CName = fmt.Sprintf("ks_f%d_%s", m.ID, d.Name)
 		fn.Pub = d.Pub
+		if d.Recv != nil {
+			c.attachMethod(m, fn)
+			continue
+		}
+		fn.CName = fmt.Sprintf("ks_f%d_%s", m.ID, d.Name)
 		declare(fn)
 	}
+}
+
+func (c *checker) attachMethod(m *Module, fn *Func) {
+	d := fn.Decl
+	if d.Name == "main" {
+		c.errorf(d.NamePos, "main cannot be a method")
+	}
+	t := fn.Recv.Type
+	if t == nil || t.Kind != KStruct || t.Struct == nil || t.Struct.Module != m {
+		got := Type(Invalid)
+		if t != nil {
+			got = t
+		}
+		c.errorf(d.Recv.Type.Pos, "a method receiver must be a struct declared in this module, not %s", got)
+		fn.CName = fmt.Sprintf("ks_bad_%s", d.Name)
+		m.Order = append(m.Order, fn)
+		return
+	}
+	si := t.Struct
+	fn.CName = fmt.Sprintf("ks_m%d_%s_%s", si.ID, si.Name, d.Name)
+	if si.FieldMap[d.Name] != nil {
+		c.errorf(d.NamePos, "method %s.%s conflicts with a field of the same name", si.Name, d.Name)
+	}
+	if si.Methods == nil {
+		si.Methods = map[string]*Func{}
+	}
+	if prev := si.Methods[d.Name]; prev != nil {
+		c.errorf(d.NamePos, "method %s.%s already declared at %d:%d", si.Name, d.Name, prev.Decl.NamePos.Line, prev.Decl.NamePos.Col)
+	} else {
+		si.Methods[d.Name] = fn
+	}
+	m.Order = append(m.Order, fn)
 }
 
 func sameSignature(a, b *Func) bool {
@@ -262,9 +312,21 @@ func sameSignature(a, b *Func) bool {
 func (c *checker) signature(m *Module, d *FuncDecl) *Func {
 	fn := &Func{Name: d.Name, Decl: d, Module: m, Result: c.resolveType(m, d.Result)}
 	seen := map[string]bool{}
+	if d.Recv != nil {
+		fn.RecvMutable = d.RecvMutable
+		fn.Recv = &Var{
+			Name: d.Recv.Name, Type: c.resolveType(m, d.Recv.Type), Pos: d.Recv.Pos,
+			Mutable: d.RecvMutable, Receiver: true, Slot: d.RecvMutable,
+		}
+		seen[d.Recv.Name] = true
+	}
 	for _, p := range d.Params {
 		if seen[p.Name] {
-			c.errorf(p.Pos, "duplicate parameter %s", p.Name)
+			if d.Recv != nil && p.Name == d.Recv.Name {
+				c.errorf(p.Pos, "parameter %s has the same name as the receiver", p.Name)
+			} else {
+				c.errorf(p.Pos, "duplicate parameter %s", p.Name)
+			}
 		}
 		seen[p.Name] = true
 		fn.Params = append(fn.Params, &Var{Name: p.Name, Type: c.resolveType(m, p.Type), Pos: p.Pos, Param: true})
@@ -298,6 +360,11 @@ func (c *checker) checkFunc(fn *Func) {
 	c.scope = nil
 	c.loops = 0
 	c.push()
+	if fn.Recv != nil {
+		c.nextVar++
+		fn.Recv.CName = fmt.Sprintf("ks_v%d_%s", c.nextVar, fn.Recv.Name)
+		c.declare(fn.Recv)
+	}
 	for _, p := range fn.Params {
 		c.nextVar++
 		p.CName = fmt.Sprintf("ks_v%d_%s", c.nextVar, p.Name)
@@ -400,6 +467,41 @@ func (c *checker) checkStmt(s Stmt) {
 		c.loops++
 		c.checkBlock(s.Body)
 		c.loops--
+	case *ForStmt:
+		c.loops++
+		var elem Type
+		switch s.Kind {
+		case ForRange, ForInclusive:
+			start := c.valueExpr(s.Start)
+			end := c.valueExpr(s.End)
+			if start != Invalid && start != IntType {
+				c.errorf(s.Start.P(), "range start must be int, not %s", start)
+			}
+			if end != Invalid && end != IntType {
+				c.errorf(s.End.P(), "range end must be int, not %s", end)
+			}
+			elem = IntType
+		default:
+			seq := c.valueExpr(s.Seq)
+			switch {
+			case seq == Invalid:
+				elem = Invalid
+			case seq.Kind == KArray:
+				elem = seq.Elem
+			case seq.Kind == KMap:
+				elem = seq.Key
+			default:
+				c.errorf(s.Seq.P(), "for expects an array or a map, not %s (ranges are for i in start..end)", seq)
+				elem = Invalid
+			}
+		}
+		c.push()
+		v := c.newVar(s.Name, elem, false, s.NamePos)
+		c.info.Loops[s] = v
+		c.declare(v)
+		c.checkStmts(s.Body.Stmts)
+		c.pop()
+		c.loops--
 	case *ReturnStmt:
 		want := c.fn.Result
 		if s.Value == nil {
@@ -427,11 +529,11 @@ func (c *checker) checkStmt(s Stmt) {
 		c.allowMut = nil
 	case *BreakStmt:
 		if c.loops == 0 {
-			c.errorf(s.Pos, "break outside of a while loop")
+			c.errorf(s.Pos, "break outside of a loop")
 		}
 	case *ContinueStmt:
 		if c.loops == 0 {
-			c.errorf(s.Pos, "continue outside of a while loop")
+			c.errorf(s.Pos, "continue outside of a loop")
 		}
 	case *BlockStmt:
 		c.checkBlock(s.Block)
@@ -472,6 +574,9 @@ func (c *checker) placeType(e Expr, whole Expr) Type {
 		}
 		c.info.Uses[e] = v
 		switch {
+		case v.Receiver && !v.Mutable:
+			c.errorf(e.Pos, "cannot assign to %s: %s is an immutable receiver (write fn (var %s: %s) to modify the caller)", describePlace(whole), v.Name, v.Name, v.Type)
+			return Invalid
 		case v.Param:
 			c.errorf(e.Pos, "cannot assign to %s: %s is a parameter (copy it into a var first)", describePlace(whole), v.Name)
 			return Invalid
@@ -483,13 +588,18 @@ func (c *checker) placeType(e Expr, whole Expr) Type {
 	case *IndexExpr:
 		base := c.place(e.X, whole)
 		idx := c.valueExpr(e.Index)
-		if idx != Invalid && idx != IntType {
-			c.errorf(e.Index.P(), "array index must be int, not %s", idx)
-		}
 		switch base.Kind {
 		case KInvalid:
 			return Invalid
+		case KMap:
+			if idx != Invalid && base.Key != Invalid && idx != base.Key {
+				c.errorf(e.Index.P(), "map key must be %s, not %s", base.Key, idx)
+			}
+			return base.Elem
 		case KArray:
+			if idx != Invalid && idx != IntType {
+				c.errorf(e.Index.P(), "array index must be int, not %s", idx)
+			}
 			return base.Elem
 		case KString:
 			c.errorf(e.X.P(), "cannot assign into a string; strings are immutable")
@@ -542,6 +652,9 @@ func (c *checker) exprWant(e Expr, want Type) Type {
 	if lit, ok := e.(*ArrayLit); ok {
 		t = c.arrayLit(lit, want)
 		c.info.Types[e] = t
+	} else if lit, ok := e.(*MapLit); ok {
+		t = c.mapLit(lit, want)
+		c.info.Types[e] = t
 	} else {
 		t = c.expr(e)
 	}
@@ -576,6 +689,40 @@ func (c *checker) arrayLit(e *ArrayLit, want Type) Type {
 		}
 	}
 	return ArrayOf(elem)
+}
+
+func (c *checker) mapLit(e *MapLit, want Type) Type {
+	var keyWant, valWant Type
+	if want != nil && want.Kind == KMap {
+		keyWant, valWant = want.Key, want.Elem
+	}
+	if len(e.Entries) == 0 {
+		if keyWant != nil {
+			return want
+		}
+		c.errorf(e.Pos, "cannot infer the type of an empty map literal; add a type annotation such as let m: {string: int} = {};")
+		return Invalid
+	}
+	var keyT, valT Type = keyWant, valWant
+	for i, en := range e.Entries {
+		kt := c.exprWant(en.Key, keyT)
+		vt := c.exprWant(en.Value, valT)
+		if keyT == nil {
+			keyT = kt
+		} else if kt != Invalid && keyT != Invalid && kt != keyT {
+			c.errorf(en.Key.P(), "map key %d has type %s, expected %s", i+1, kt, keyT)
+		}
+		if valT == nil {
+			valT = vt
+		} else if vt != Invalid && valT != Invalid && vt != valT {
+			c.errorf(en.Value.P(), "map value %d has type %s, expected %s", i+1, vt, valT)
+		}
+	}
+	if keyT != Invalid && keyT != StringType && keyT != IntType {
+		c.errorf(e.Pos, "map keys must be string or int, not %s", keyT)
+		return Invalid
+	}
+	return MapOf(keyT, valT)
 }
 
 func (c *checker) expr(e Expr) Type {
@@ -632,13 +779,18 @@ func (c *checker) exprType(e Expr) Type {
 	case *IndexExpr:
 		base := c.valueExpr(e.X)
 		idx := c.valueExpr(e.Index)
-		if idx != Invalid && idx != IntType {
-			c.errorf(e.Index.P(), "array index must be int, not %s", idx)
-		}
 		switch base.Kind {
 		case KInvalid:
 			return Invalid
+		case KMap:
+			if idx != Invalid && base.Key != Invalid && idx != base.Key {
+				c.errorf(e.Index.P(), "map key must be %s, not %s", base.Key, idx)
+			}
+			return base.Elem
 		case KArray:
+			if idx != Invalid && idx != IntType {
+				c.errorf(e.Index.P(), "array index must be int, not %s", idx)
+			}
 			return base.Elem
 		case KString:
 			c.errorf(e.X.P(), "cannot index a string; use byte_at(s, i) or substr(s, start, count)")
@@ -648,6 +800,8 @@ func (c *checker) exprType(e Expr) Type {
 		return Invalid
 	case *ArrayLit:
 		return c.arrayLit(e, nil)
+	case *MapLit:
+		return c.mapLit(e, nil)
 	case *StructLit:
 		return c.structLit(e)
 	case *UnaryExpr:
@@ -789,15 +943,10 @@ func (c *checker) call(e *CallExpr) Type {
 			c.errorf(callee.Pos, "undefined function: %s", name)
 		}
 	case *SelectorExpr:
-		m, alias, ok := c.moduleRef(callee.X)
-		if !ok {
-			if id, isIdent := callee.X.(*Ident); isIdent && c.scope.lookup(id.Name) == nil {
-				c.errorf(id.Pos, "undefined: %s", id.Name)
-				break
-			}
-			c.errorf(callee.NamePos, "%s is not a function; only functions can be called", describePlace(callee))
-			break
+		if _, _, ok := c.moduleRef(callee.X); !ok {
+			return c.methodCall(e, callee)
 		}
+		m, alias, _ := c.moduleRef(callee.X)
 		name = alias + "." + callee.Name
 		f := m.Funcs[callee.Name]
 		switch {
@@ -833,6 +982,88 @@ func (c *checker) call(e *CallExpr) Type {
 		}
 	}
 	return fn.Result
+}
+
+func (c *checker) methodCall(e *CallExpr, callee *SelectorExpr) Type {
+	recvT := c.valueExpr(callee.X)
+	label := callee.Name
+	if recvT != nil && recvT != Invalid {
+		label = recvT.String() + "." + callee.Name
+	}
+	var fn *Func
+	if recvT != nil && recvT.Kind == KStruct && recvT.Struct != nil {
+		fn = recvT.Struct.Methods[callee.Name]
+	}
+	if fn == nil {
+		switch {
+		case recvT == Invalid || recvT == nil:
+		case recvT.Kind == KStruct && recvT.Struct != nil && recvT.Struct.FieldMap[callee.Name] != nil:
+			c.errorf(callee.NamePos, "%s is a field of %s, not a method", callee.Name, recvT)
+		default:
+			c.errorf(callee.NamePos, "%s has no method %s", recvT, callee.Name)
+		}
+		for _, a := range e.Args {
+			c.valueExpr(a)
+		}
+		return Invalid
+	}
+	if fn.Module != c.mod && !fn.Pub {
+		c.errorf(callee.NamePos, "method %s is not public (declare it with pub fn)", label)
+	}
+	if fn.RecvMutable {
+		if !isPlace(callee.X) {
+			c.errorf(callee.X.P(), "%s changes its receiver, so the receiver must be a var, field or element", label)
+		} else {
+			c.requireMutable(callee.X)
+		}
+	}
+	c.info.Calls[e] = fn
+	if len(e.Args) != len(fn.Params) {
+		for _, a := range e.Args {
+			c.valueExpr(a)
+		}
+		c.errorf(e.Pos, "%s expects %d argument%s, got %d", label, len(fn.Params), plural(len(fn.Params)), len(e.Args))
+		return fn.Result
+	}
+	for i, a := range e.Args {
+		want := fn.Params[i].Type
+		got := c.exprWant(a, want)
+		if got != Invalid && want != Invalid && got != want {
+			c.errorf(a.P(), "argument %d of %s must be %s, not %s", i+1, label, want, got)
+		}
+	}
+	return fn.Result
+}
+
+func (c *checker) requireMutable(e Expr) {
+	cur := e
+	for {
+		switch n := cur.(type) {
+		case *Ident:
+			v := c.info.Uses[n]
+			if v == nil {
+				v = c.scope.lookup(n.Name)
+			}
+			if v == nil {
+				return
+			}
+			switch {
+			case v.Receiver && !v.Mutable:
+				c.errorf(n.Pos, "cannot assign to %s: %s is an immutable receiver (write fn (var %s: %s) to modify the caller)", n.Name, v.Name, v.Name, v.Type)
+			case v.Param:
+				c.errorf(n.Pos, "cannot assign to %s: %s is a parameter (copy it into a var first)", n.Name, v.Name)
+			case !v.Mutable:
+				c.errorf(n.Pos, "cannot assign to %s: %s is immutable (declared with let at %d:%d; use var to allow assignment)", n.Name, v.Name, v.Pos.Line, v.Pos.Col)
+			}
+			return
+		case *IndexExpr:
+			cur = n.X
+		case *SelectorExpr:
+			cur = n.X
+		default:
+			return
+		}
+	}
 }
 
 func plural(n int) string {
