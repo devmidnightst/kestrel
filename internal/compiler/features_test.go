@@ -1,14 +1,18 @@
 package compiler
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type runResult struct {
@@ -285,6 +289,59 @@ func TestExitBuiltin(t *testing.T) {
 	if r.code != 3 || r.stdout != "partial\n" {
 		t.Errorf("exit %d, out %q", r.code, r.stdout)
 	}
+}
+
+func TestTCPHTTPOnce(t *testing.T) {
+	requireCC(t)
+	src, err := os.ReadFile(filepath.Join("..", "..", "examples", "http", "server.ks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := writeFiles(t, map[string]string{"main.ks": string(src)})
+	exe := filepath.Join(dir, "prog")
+	if err := Build(filepath.Join(dir, "main.ks"), BuildOptions{Output: exe}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	if f, ok := stdout.(*os.File); ok {
+		_ = f.SetDeadline(time.Now().Add(5 * time.Second))
+	}
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("port: %v stderr %s", err, stderr.String())
+	}
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strings.TrimSpace(line), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "HTTP/1.1 200 OK") || !strings.HasSuffix(string(body), "ok") {
+		t.Fatalf("response %q", body)
+	}
+	_ = cmd.Wait()
 }
 
 func TestMemoryStaysBounded(t *testing.T) {

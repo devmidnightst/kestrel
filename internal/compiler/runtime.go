@@ -4,8 +4,11 @@ import "strings"
 
 const runtimeHead = `#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
+#include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -13,7 +16,11 @@ const runtimeHead = `#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #if defined(__unix__) || defined(__APPLE__)
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
 #define KS_HAVE_RLIMIT 1
 #endif
@@ -61,6 +68,7 @@ __attribute__((noreturn, unused, format(printf, 1, 2))) static void ks_panicf(co
 }
 
 KS_RT void ks_init_stack(uintptr_t base) {
+	signal(SIGPIPE, SIG_IGN);
 	size_t size = 1u << 20;
 #ifdef KS_HAVE_RLIMIT
 	struct rlimit rl;
@@ -688,6 +696,103 @@ KS_RT bool ks_file_exists(ks_obj *path) {
 	if (f == NULL) return false;
 	fclose(f);
 	return true;
+}
+
+KS_RT int ks_tcp_cloexec(int fd) {
+	int flags = fcntl(fd, F_GETFD);
+	if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+	return fd;
+}
+
+KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode) {
+	if (port < 0 || port > 65535) return -1;
+	ks_str *h = KS_S(host);
+	if (h->len == 0 || h->len > 255 || memchr(h->data, 0, (size_t)h->len) != NULL) return -1;
+	char hostbuf[256];
+	memcpy(hostbuf, h->data, (size_t)h->len);
+	hostbuf[h->len] = 0;
+	char portbuf[16];
+	snprintf(portbuf, sizeof portbuf, "%" PRId64, port);
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (listen_mode) hints.ai_flags = AI_PASSIVE;
+	struct addrinfo *res = NULL;
+	if (getaddrinfo(hostbuf, portbuf, &hints, &res) != 0) return -1;
+	int fd = -1;
+	for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd < 0) continue;
+		ks_tcp_cloexec(fd);
+		if (listen_mode) {
+			int one = 1;
+			setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
+		} else if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	return fd;
+}
+
+KS_RT int64_t ks_tcp_listen(ks_obj *host, int64_t port) {
+	return ks_tcp_open(host, port, true);
+}
+
+KS_RT int64_t ks_tcp_connect(ks_obj *host, int64_t port) {
+	return ks_tcp_open(host, port, false);
+}
+
+KS_RT int64_t ks_tcp_port(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof ss;
+	if (getsockname((int)fd, (struct sockaddr *)&ss, &len) != 0) return -1;
+	if (ss.ss_family == AF_INET) return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+	if (ss.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+	return -1;
+}
+
+KS_RT int64_t ks_tcp_accept(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	int c = accept((int)fd, NULL, NULL);
+	if (c < 0) return -1;
+	return ks_tcp_cloexec(c);
+}
+
+KS_RT ks_obj *ks_tcp_read(int64_t fd, int64_t maxn) {
+	if (fd < 0 || fd > INT32_MAX || maxn <= 0) return ks_str_from("", 0);
+	if (maxn > (1 << 20)) maxn = 1 << 20;
+	char *buf = ks_alloc((size_t)maxn);
+	ssize_t n = read((int)fd, buf, (size_t)maxn);
+	if (n < 0) n = 0;
+	ks_obj *r = ks_str_from(buf, (int64_t)n);
+	free(buf);
+	return r;
+}
+
+KS_RT int64_t ks_tcp_write(int64_t fd, ks_obj *data) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	ks_str *s = KS_S(data);
+	int64_t off = 0;
+	while (off < s->len) {
+		ssize_t n = write((int)fd, s->data + off, (size_t)(s->len - off));
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			return -1;
+		}
+		off += n;
+	}
+	return off;
+}
+
+KS_RT void ks_tcp_close(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return;
+	close((int)fd);
 }
 
 KS_RT void ks_exit(int64_t code) {

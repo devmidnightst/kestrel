@@ -258,6 +258,7 @@ func TestNewTypeErrors(t *testing.T) {
 		{"fn main() { print(str([1])); }", "str expects int, float, bool or string, not [int]"},
 		{"fn main() { print(min(1, 2.0)); }", "min expects two ints or two floats, not int and float"},
 		{"fn main() { print(slice(\"ab\", 0, 1)); }", "slice expects an array, not string (use substr for strings)"},
+		{"fn main() { let s = tcp_listen(1, 80); }", "argument 1 of tcp_listen must be string, not int"},
 		{"fn main() { print(sqrt(4)); }", "argument 1 of sqrt must be float, not int"},
 		{"fn main() { let x: [int] = [1.5]; }", "array element 1 has type float, expected int"},
 		{"struct P { x: int } fn main() { let p = P { x: 1, y: 2 }; }", "struct P has no field y"},
