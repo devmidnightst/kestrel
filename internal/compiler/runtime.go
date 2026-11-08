@@ -1096,6 +1096,23 @@ KS_RT void ks_sleep_ms(int64_t ms) {
 	while (nanosleep(&ts, &rem) != 0 && errno == EINTR && !ks_shutdown_flag) ts = rem;
 }
 
+// ks_format_time renders milliseconds since the epoch as RFC 3339 UTC,
+// e.g. 2026-11-08T02:07:11.123Z.
+KS_RT ks_obj *ks_format_time(int64_t ms) {
+	int64_t secs = ms / 1000, frac = ms % 1000;
+	if (frac < 0) {
+		frac += 1000;
+		secs--;
+	}
+	time_t t = (time_t)secs;
+	struct tm tm;
+	if (gmtime_r(&t, &tm) == NULL) ks_panicf("format_time: %" PRId64 " is out of range", ms);
+	char buf[64];
+	int n = snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+		tm.tm_hour, tm.tm_min, tm.tm_sec, (int)frac);
+	return ks_str_from(buf, n);
+}
+
 KS_RT int64_t ks_cpu_count(void) {
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
 	return n > 0 ? (int64_t)n : 1;

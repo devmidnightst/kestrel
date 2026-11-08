@@ -66,6 +66,7 @@ var fixedBuiltins = map[string]builtinSig{
 	"shutdown_requested": {nil, BoolType, "ks_shutdown_requested"},
 	"fork_workers":       {[]Type{IntType}, IntType, "ks_fork_workers"},
 	"cpu_count":          {nil, IntType, "ks_cpu_count"},
+	"format_time":        {[]Type{IntType}, StringType, "ks_format_time"},
 
 	"random_bytes":     {[]Type{IntType}, StringType, "ks_random_bytes"},
 	"random_int":       {[]Type{IntType, IntType}, IntType, "ks_random_int"},

@@ -418,3 +418,11 @@ fn main() -> ! {
 		t.Errorf("exit %d, stderr %q\ngot  %q\nwant %q", r.code, r.stderr, r.stdout, want)
 	}
 }
+
+func TestFormatTime(t *testing.T) {
+	requireCC(t)
+	r := runWith(t, `fn main() { print(format_time(0), format_time(1794106150524), format_time(-1), len(format_time(time_ms()))); }`, "", false)
+	if r.stdout != "1970-01-01T00:00:00.000Z 2026-11-08T02:49:10.524Z 1969-12-31T23:59:59.999Z 24\n" {
+		t.Errorf("got %q (stderr %q)", r.stdout, r.stderr)
+	}
+}
