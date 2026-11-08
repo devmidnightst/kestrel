@@ -50,6 +50,12 @@ jobs:
             ./kestrel run --release "$f" < /dev/null > /dev/null
           done
           ./kestrel build --release examples/http/service.ks -o service
+      - name: kestrel test
+        run: |
+          ./kestrel test examples/testing
+          ./kestrel test --sanitize examples/testing
+      - name: runtime parser fuzz
+        run: KESTREL_FUZZ_ITERS=300000 go test -count=1 -run TestRuntimeParserFuzz ./internal/compiler
       - name: install script syntax
         run: sh -n install.sh
 

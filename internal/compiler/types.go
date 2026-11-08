@@ -154,9 +154,12 @@ type Field struct {
 }
 
 type Module struct {
-	ID          int
-	Path        string
-	Display     string
+	ID      int
+	Path    string
+	Display string
+	// Rel is the path relative to the project root, with forward slashes.
+	// Runtime error locations use it.
+	Rel         string
 	File        *File
 	Imports     map[string]*Module
 	Funcs       map[string]*Func
@@ -207,4 +210,7 @@ type Program struct {
 	Entry   *Module
 	Main    *Func
 	Info    *Info
+	// Tests holds the entry file's test_ functions when the program was
+	// loaded for kestrel test; Main may then be nil.
+	Tests []*Func
 }

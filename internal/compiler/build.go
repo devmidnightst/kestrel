@@ -54,6 +54,23 @@ func Build(entry string, opts BuildOptions) error {
 	if err != nil {
 		return err
 	}
+	return buildProgram(prog, opts)
+}
+
+// BuildTests compiles entry's test_ functions into a test runner. It
+// returns the number of tests found.
+func BuildTests(entry string, opts BuildOptions) (int, error) {
+	prog, err := LoadTests(entry)
+	if err != nil {
+		return 0, err
+	}
+	if prog.Tests == nil {
+		prog.Tests = []*Func{}
+	}
+	return len(prog.Tests), buildProgram(prog, opts)
+}
+
+func buildProgram(prog *Program, opts BuildOptions) error {
 	src := GenerateC(prog)
 	if opts.EmitC != "" {
 		if err := os.WriteFile(opts.EmitC, []byte(src), 0o644); err != nil {

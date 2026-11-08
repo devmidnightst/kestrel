@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Runtime errors print where they happened: `    at app.ks:12 in main` (methods as `Type.name`, paths relative to the project root).
+- `tcp_wait` waits for readable and writable sockets together; `tcp_send` writes without blocking; `tcp_try_accept` never hangs; `tcp_connect_timeout`. Listening sockets are non-blocking and `tcp_accept` waits with poll.
+- `fork_workers(n)` runs worker processes under a supervisor that restarts crashed workers and forwards shutdown signals. `cpu_count()`.
+- Maps keep insertion order, and their hashes are keyed per process (SipHash-1-3 for strings), so clients cannot force collisions. `keys`, `values`, `for` and `print` follow insertion order.
+- `random_bytes`, `random_int`, `sha256`, `hmac_sha256`, `pbkdf2_sha256`, `constant_time_eq`, `hex`/`unhex`, `base64`/`base64url`/`unbase64`, `url_encode`/`url_decode`, `format_time`.
+- JSON by path: `json_valid`, `json_type`, `json_string`, `json_int`, `json_float`, `json_bool`, `json_len`, `json_keys`, `json_raw`, `json_member`, `json_quote`.
+- A standard library embedded in the compiler: `import "std:http";` frames, parses and builds HTTP/1.1 messages.
+- `kestrel test` runs `fn test_...()` functions from `*_test.ks` files, each in its own process.
+- `examples/http/service.ks` uses std:http, keep-alive, non-blocking writes and `WORKERS`. A load test, a worker crash test and a fuzzer for the runtime's parsers run in CI.
+
 - Result types for recoverable errors: `!T` and `!`, built with `ok(v)`, `ok()` and `err(message)`, and inspected with `is_ok`, `is_err`, `error`, `unwrap` and `unwrap_or`.
 - `try f()` returns an error from the current function, releasing everything it holds. `fn main() -> !` prints `kestrel: error: <message>` and exits with status 1.
 - `try_read_file`, `try_write_file`, `try_parse_int` and `try_parse_float` return results instead of stopping the program.

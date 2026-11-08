@@ -24,6 +24,7 @@ const runtimeHead = `#define _POSIX_C_SOURCE 200809L
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__unix__) || defined(__APPLE__)
@@ -59,10 +60,13 @@ static uintptr_t ks_stack_limit;
 static ks_obj *ks_pending;
 static bool ks_draining;
 static volatile sig_atomic_t ks_shutdown_flag;
+static bool ks_shutdown_trapped;
+static const char *ks_loc;
 
 __attribute__((noreturn, unused)) static void ks_panic(const char *msg) {
 	fflush(stdout);
 	fprintf(stderr, "kestrel: runtime error: %s\n", msg);
+	if (ks_loc != NULL) fprintf(stderr, "    at %s\n", ks_loc);
 	fflush(stderr);
 	_Exit(101);
 }
@@ -720,6 +724,14 @@ KS_RT int ks_tcp_cloexec(int fd) {
 	return fd;
 }
 
+// Listening sockets are non-blocking so that tcp_try_accept never hangs when
+// another worker took the connection first; tcp_accept waits with poll.
+KS_RT void ks_set_nonblock(int fd, bool on) {
+	int fl = fcntl(fd, F_GETFL);
+	if (fl < 0) return;
+	fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+}
+
 KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode, bool shared) {
 	if (port < 0 || port > 65535) return -1;
 	ks_str *h = KS_S(host);
@@ -757,7 +769,10 @@ KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode, bool sha
 				continue;
 #endif
 			}
-			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
+			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 1024) == 0) {
+				ks_set_nonblock(fd, true);
+				break;
+			}
 		} else if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
 			break;
 		}
@@ -790,11 +805,84 @@ KS_RT int64_t ks_tcp_port(int64_t fd) {
 	return -1;
 }
 
+KS_RT int64_t ks_accept_one(int fd) {
+	int c = accept(fd, NULL, NULL);
+	if (c < 0) return -1;
+	ks_set_nonblock(c, false);
+	return ks_tcp_cloexec(c);
+}
+
 KS_RT int64_t ks_tcp_accept(int64_t fd) {
 	if (fd < 0 || fd > INT32_MAX) return -1;
-	int c = accept((int)fd, NULL, NULL);
-	if (c < 0) return -1;
-	return ks_tcp_cloexec(c);
+	for (;;) {
+		int64_t c = ks_accept_one((int)fd);
+		if (c >= 0) return c;
+		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED) return -1;
+		struct pollfd p = {(int)fd, POLLIN, 0};
+		if (poll(&p, 1, -1) < 0) return -1;
+	}
+}
+
+KS_RT int64_t ks_tcp_try_accept(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	return ks_accept_one((int)fd);
+}
+
+KS_RT int64_t ks_tcp_connect_timeout(ks_obj *host, int64_t port, int64_t ms) {
+	if (port < 0 || port > 65535) return -1;
+	ks_str *h = KS_S(host);
+	if (h->len == 0 || h->len > 255 || memchr(h->data, 0, (size_t)h->len) != NULL) return -1;
+	char portbuf[16];
+	snprintf(portbuf, sizeof portbuf, "%" PRId64, port);
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	struct addrinfo *res = NULL;
+	if (getaddrinfo(h->data, portbuf, &hints, &res) != 0) return -1;
+	int fd = -1;
+	int t = ms < 0 ? -1 : (ms > INT32_MAX ? INT32_MAX : (int)ms);
+	for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd < 0) continue;
+		ks_tcp_cloexec(fd);
+		ks_set_nonblock(fd, true);
+		int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+		if (rc != 0 && errno == EINPROGRESS) {
+			struct pollfd p = {fd, POLLOUT, 0};
+			int err = 0;
+			socklen_t len = sizeof err;
+			if (poll(&p, 1, t) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) rc = 0;
+		}
+		if (rc == 0) {
+			ks_set_nonblock(fd, false);
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	return fd;
+}
+
+KS_RT int64_t ks_tcp_send(int64_t fd, ks_obj *data) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	ks_str *s = KS_S(data);
+	if (s->len == 0) return 0;
+	int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+	flags |= MSG_NOSIGNAL;
+#endif
+	// MSG_DONTWAIT alone is not enough: darwin's send still blocks on a
+	// blocking socket. Make the socket non-blocking for this call only.
+	int fl = fcntl((int)fd, F_GETFL);
+	bool toggled = fl >= 0 && !(fl & O_NONBLOCK);
+	if (toggled) fcntl((int)fd, F_SETFL, fl | O_NONBLOCK);
+	ssize_t n = send((int)fd, s->data, (size_t)s->len, flags);
+	int e = errno;
+	if (toggled) fcntl((int)fd, F_SETFL, fl);
+	if (n < 0) return (e == EAGAIN || e == EWOULDBLOCK || e == EINTR) ? 0 : -1;
+	return (int64_t)n;
 }
 
 KS_RT ks_obj *ks_tcp_read(int64_t fd, int64_t maxn) {
@@ -917,6 +1005,36 @@ KS_RT ks_obj *ks_tcp_poll(ks_obj *fdso, int64_t timeout) {
 	return r;
 }
 
+KS_RT ks_obj *ks_tcp_wait(ks_obj *ro, ks_obj *wo, int64_t timeout) {
+	ks_arr_i64 *r = (ks_arr_i64 *)ro, *w = (ks_arr_i64 *)wo;
+	if (r->len > (int64_t)INT32_MAX / 2 || w->len > (int64_t)INT32_MAX / 2) ks_panic("tcp_wait: too many sockets");
+	int64_t n = r->len + w->len;
+	struct pollfd *pfd = ks_alloc((size_t)n * sizeof(struct pollfd));
+	for (int64_t i = 0; i < n; i++) {
+		int64_t fd = i < r->len ? r->data[i] : w->data[i - r->len];
+		pfd[i].fd = fd < 0 || fd > INT32_MAX ? -1 : (int)fd;
+		pfd[i].events = i < r->len ? POLLIN : POLLOUT;
+		pfd[i].revents = 0;
+	}
+	int t = timeout < 0 ? -1 : (timeout > INT32_MAX ? INT32_MAX : (int)timeout);
+	int got = poll(pfd, (nfds_t)n, t);
+	ks_obj *readable = ks_arr_i64_new(0), *writable = ks_arr_i64_new(0);
+	if (got > 0) {
+		for (int64_t i = 0; i < n; i++) {
+			if (pfd[i].fd < 0) continue;
+			short want = i < r->len ? POLLIN : POLLOUT;
+			if (!(pfd[i].revents & (want | POLLHUP | POLLERR | POLLNVAL))) continue;
+			if (i < r->len) ks_arr_i64_push(readable, r->data[i]);
+			else ks_arr_i64_push(writable, w->data[i - r->len]);
+		}
+	}
+	free(pfd);
+	ks_obj *out = ks_arr_obj_new(2);
+	ks_arr_obj_push(out, readable);
+	ks_arr_obj_push(out, writable);
+	return out;
+}
+
 KS_RT bool ks_tcp_set_timeout(int64_t fd, int64_t ms) {
 	if (fd < 0 || fd > INT32_MAX) return false;
 	if (ms < 0) ms = 0;
@@ -985,6 +1103,28 @@ KS_RT void ks_sleep_ms(int64_t ms) {
 	while (nanosleep(&ts, &rem) != 0 && errno == EINTR && !ks_shutdown_flag) ts = rem;
 }
 
+// ks_format_time renders milliseconds since the epoch as RFC 3339 UTC,
+// e.g. 2026-11-08T02:07:11.123Z.
+KS_RT ks_obj *ks_format_time(int64_t ms) {
+	int64_t secs = ms / 1000, frac = ms % 1000;
+	if (frac < 0) {
+		frac += 1000;
+		secs--;
+	}
+	time_t t = (time_t)secs;
+	struct tm tm;
+	if (gmtime_r(&t, &tm) == NULL) ks_panicf("format_time: %" PRId64 " is out of range", ms);
+	char buf[64];
+	int n = snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+		tm.tm_hour, tm.tm_min, tm.tm_sec, (int)frac);
+	return ks_str_from(buf, n);
+}
+
+KS_RT int64_t ks_cpu_count(void) {
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	return n > 0 ? (int64_t)n : 1;
+}
+
 KS_RT int64_t ks_pid(void) {
 	return (int64_t)getpid();
 }
@@ -995,6 +1135,7 @@ static void ks_on_shutdown(int sig) {
 }
 
 KS_RT void ks_trap_shutdown(void) {
+	ks_shutdown_trapped = true;
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = ks_on_shutdown;
@@ -1006,6 +1147,901 @@ KS_RT void ks_trap_shutdown(void) {
 
 KS_RT bool ks_shutdown_requested(void) {
 	return ks_shutdown_flag != 0;
+}
+
+static volatile sig_atomic_t ks_sup_stop;
+
+static void ks_sup_on_signal(int sig) {
+	(void)sig;
+	ks_sup_stop = 1;
+}
+
+KS_RT void ks_sup_signals(void (*handler)(int)) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+// ks_fork_workers runs n worker processes and supervises them. Each worker
+// returns from fork_workers with its index; the supervisor never returns.
+// A worker that crashes or exits non-zero is replaced (after a pause if it
+// died within a second of starting). SIGTERM or SIGINT to the supervisor
+// is forwarded to every worker; workers get 30 seconds to exit before
+// SIGKILL, then the supervisor exits 0.
+KS_RT int64_t ks_fork_workers(int64_t n) {
+	if (n < 1 || n > 1024) ks_panicf("fork_workers: worker count %" PRId64 " must be 1 to 1024", n);
+	fflush(stdout);
+	fflush(stderr);
+	pid_t *pids = ks_alloc((size_t)n * sizeof(pid_t));
+	int64_t *started = ks_alloc((size_t)n * sizeof(int64_t));
+	ks_sup_signals(ks_sup_on_signal);
+	int64_t live = 0;
+	for (int64_t i = 0; i <= n; i++) {
+		if (i == n) break;
+		pid_t p = fork();
+		if (p < 0) ks_panicf("fork_workers: fork failed: %s", strerror(errno));
+		if (p == 0) {
+			free(pids);
+			free(started);
+			if (ks_shutdown_trapped) ks_trap_shutdown();
+			else ks_sup_signals(SIG_DFL);
+			return i;
+		}
+		pids[i] = p;
+		started[i] = ks_clock_ms();
+		live++;
+	}
+	int64_t stop_at = -1;
+	while (live > 0) {
+		if (ks_sup_stop && stop_at < 0) {
+			stop_at = ks_clock_ms();
+			for (int64_t i = 0; i < n; i++) if (pids[i] > 0) kill(pids[i], SIGTERM);
+		}
+		if (stop_at >= 0 && ks_clock_ms() - stop_at > 30000) {
+			for (int64_t i = 0; i < n; i++) if (pids[i] > 0) kill(pids[i], SIGKILL);
+		}
+		int status = 0;
+		pid_t p = waitpid(-1, &status, WNOHANG);
+		if (p < 0 && errno == ECHILD) break;
+		if (p <= 0) {
+			struct timespec ts = {0, 50 * 1000000L};
+			nanosleep(&ts, NULL);
+			continue;
+		}
+		int64_t i = 0;
+		while (i < n && pids[i] != p) i++;
+		if (i == n) continue;
+		pids[i] = 0;
+		live--;
+		bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+		if (stop_at >= 0 || clean) continue;
+		if (WIFSIGNALED(status)) {
+			fprintf(stderr, "kestrel: worker %" PRId64 " (pid %d) killed by signal %d; restarting\n", i, (int)p, WTERMSIG(status));
+		} else {
+			fprintf(stderr, "kestrel: worker %" PRId64 " (pid %d) exited with status %d; restarting\n", i, (int)p, WEXITSTATUS(status));
+		}
+		fflush(stderr);
+		if (ks_clock_ms() - started[i] < 1000) {
+			struct timespec ts = {1, 0};
+			nanosleep(&ts, NULL);
+			if (ks_sup_stop) continue;
+		}
+		pid_t c = fork();
+		if (c < 0) {
+			fprintf(stderr, "kestrel: fork_workers: fork failed: %s\n", strerror(errno));
+			continue;
+		}
+		if (c == 0) {
+			free(pids);
+			free(started);
+			if (ks_shutdown_trapped) ks_trap_shutdown();
+			else ks_sup_signals(SIG_DFL);
+			return i;
+		}
+		pids[i] = c;
+		started[i] = ks_clock_ms();
+		live++;
+	}
+	fflush(stdout);
+	fflush(stderr);
+	_Exit(0);
+}
+
+// ks_os_random fills buf from the kernel's CSPRNG and stops the program if
+// it cannot: a program that asked for secure random bytes must never get
+// predictable ones.
+KS_RT void ks_os_random(unsigned char *buf, size_t n) {
+	static int fd = -1;
+	if (fd < 0) {
+		fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+		if (fd < 0) ks_panicf("random: cannot open /dev/urandom: %s", strerror(errno));
+	}
+	size_t off = 0;
+	while (off < n) {
+		ssize_t r = read(fd, buf + off, n - off);
+		if (r < 0 && errno == EINTR) continue;
+		if (r <= 0) ks_panic("random: cannot read /dev/urandom");
+		off += (size_t)r;
+	}
+}
+
+KS_RT ks_obj *ks_random_bytes(int64_t n) {
+	if (n < 0 || n > (1 << 30)) ks_panicf("random_bytes: count %" PRId64 " must be 0 to 1073741824", n);
+	char *d;
+	ks_obj *r = ks_str_alloc(n, &d);
+	ks_os_random((unsigned char *)d, (size_t)n);
+	return r;
+}
+
+KS_RT int64_t ks_random_int(int64_t lo, int64_t hi) {
+	if (lo > hi) ks_panicf("random_int: low %" PRId64 " is greater than high %" PRId64, lo, hi);
+	uint64_t span = (uint64_t)hi - (uint64_t)lo;
+	uint64_t x;
+	if (span == UINT64_MAX) {
+		ks_os_random((unsigned char *)&x, sizeof x);
+		return (int64_t)x;
+	}
+	uint64_t range = span + 1;
+	uint64_t limit = UINT64_MAX - (UINT64_MAX % range);
+	do {
+		ks_os_random((unsigned char *)&x, sizeof x);
+	} while (x >= limit);
+	return (int64_t)((uint64_t)lo + x % range);
+}
+
+typedef struct {
+	uint32_t h[8];
+	uint64_t len;
+	unsigned char buf[64];
+	size_t fill;
+} ks_sha256;
+
+static const uint32_t ks_sha256_k[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+#define KS_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+KS_RT void ks_sha256_block(ks_sha256 *c, const unsigned char *p) {
+	uint32_t w[64];
+	for (int i = 0; i < 16; i++) {
+		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | (uint32_t)p[4 * i + 3];
+	}
+	for (int i = 16; i < 64; i++) {
+		uint32_t s0 = KS_ROR32(w[i - 15], 7) ^ KS_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		uint32_t s1 = KS_ROR32(w[i - 2], 17) ^ KS_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+	uint32_t a = c->h[0], b = c->h[1], cc = c->h[2], d = c->h[3], e = c->h[4], f = c->h[5], g = c->h[6], h = c->h[7];
+	for (int i = 0; i < 64; i++) {
+		uint32_t S1 = KS_ROR32(e, 6) ^ KS_ROR32(e, 11) ^ KS_ROR32(e, 25);
+		uint32_t ch = (e & f) ^ (~e & g);
+		uint32_t t1 = h + S1 + ch + ks_sha256_k[i] + w[i];
+		uint32_t S0 = KS_ROR32(a, 2) ^ KS_ROR32(a, 13) ^ KS_ROR32(a, 22);
+		uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+		uint32_t t2 = S0 + maj;
+		h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+	}
+	c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+	c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
+}
+
+KS_RT void ks_sha256_init(ks_sha256 *c) {
+	static const uint32_t iv[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+	memcpy(c->h, iv, sizeof iv);
+	c->len = 0;
+	c->fill = 0;
+}
+
+KS_RT void ks_sha256_update(ks_sha256 *c, const unsigned char *p, size_t n) {
+	c->len += (uint64_t)n;
+	while (n > 0) {
+		size_t take = 64 - c->fill;
+		if (take > n) take = n;
+		memcpy(c->buf + c->fill, p, take);
+		c->fill += take;
+		p += take;
+		n -= take;
+		if (c->fill == 64) {
+			ks_sha256_block(c, c->buf);
+			c->fill = 0;
+		}
+	}
+}
+
+KS_RT void ks_sha256_final(ks_sha256 *c, unsigned char out[32]) {
+	uint64_t bits = c->len * 8;
+	unsigned char pad = 0x80;
+	ks_sha256_update(c, &pad, 1);
+	unsigned char zero = 0;
+	while (c->fill != 56) ks_sha256_update(c, &zero, 1);
+	unsigned char lenb[8];
+	for (int i = 0; i < 8; i++) lenb[i] = (unsigned char)(bits >> (56 - 8 * i));
+	ks_sha256_update(c, lenb, 8);
+	for (int i = 0; i < 8; i++) {
+		out[4 * i] = (unsigned char)(c->h[i] >> 24);
+		out[4 * i + 1] = (unsigned char)(c->h[i] >> 16);
+		out[4 * i + 2] = (unsigned char)(c->h[i] >> 8);
+		out[4 * i + 3] = (unsigned char)c->h[i];
+	}
+}
+
+KS_RT ks_obj *ks_sha256_str(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	ks_sha256 c;
+	unsigned char out[32];
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, (const unsigned char *)s->data, (size_t)s->len);
+	ks_sha256_final(&c, out);
+	return ks_str_from((const char *)out, 32);
+}
+
+KS_RT void ks_hmac_raw(const unsigned char *key, size_t klen, const unsigned char *msg, size_t mlen, unsigned char out[32]) {
+	unsigned char k[64];
+	memset(k, 0, sizeof k);
+	if (klen > 64) {
+		ks_sha256 c;
+		ks_sha256_init(&c);
+		ks_sha256_update(&c, key, klen);
+		ks_sha256_final(&c, k);
+	} else if (klen > 0) {
+		memcpy(k, key, klen);
+	}
+	unsigned char ipad[64], opad[64], inner[32];
+	for (int i = 0; i < 64; i++) {
+		ipad[i] = k[i] ^ 0x36;
+		opad[i] = k[i] ^ 0x5c;
+	}
+	ks_sha256 c;
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, ipad, 64);
+	ks_sha256_update(&c, msg, mlen);
+	ks_sha256_final(&c, inner);
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, opad, 64);
+	ks_sha256_update(&c, inner, 32);
+	ks_sha256_final(&c, out);
+}
+
+KS_RT ks_obj *ks_hmac_sha256(ks_obj *ko, ks_obj *mo) {
+	ks_str *k = KS_S(ko), *m = KS_S(mo);
+	unsigned char out[32];
+	ks_hmac_raw((const unsigned char *)k->data, (size_t)k->len, (const unsigned char *)m->data, (size_t)m->len, out);
+	return ks_str_from((const char *)out, 32);
+}
+
+KS_RT ks_obj *ks_pbkdf2_sha256(ks_obj *po, ks_obj *so, int64_t iters, int64_t len) {
+	if (iters < 1 || iters > 100000000) ks_panicf("pbkdf2_sha256: iterations %" PRId64 " must be 1 to 100000000", iters);
+	if (len < 1 || len > 1024) ks_panicf("pbkdf2_sha256: length %" PRId64 " must be 1 to 1024", len);
+	ks_str *p = KS_S(po), *s = KS_S(so);
+	if (s->len > (1 << 20)) ks_panic("pbkdf2_sha256: salt too long");
+	char *out;
+	ks_obj *r = ks_str_alloc(len, &out);
+	unsigned char *msg = ks_alloc((size_t)s->len + 4);
+	if (s->len > 0) memcpy(msg, s->data, (size_t)s->len);
+	int64_t done = 0;
+	for (uint32_t block = 1; done < len; block++) {
+		msg[s->len] = (unsigned char)(block >> 24);
+		msg[s->len + 1] = (unsigned char)(block >> 16);
+		msg[s->len + 2] = (unsigned char)(block >> 8);
+		msg[s->len + 3] = (unsigned char)block;
+		unsigned char u[32], t[32];
+		ks_hmac_raw((const unsigned char *)p->data, (size_t)p->len, msg, (size_t)s->len + 4, u);
+		memcpy(t, u, 32);
+		for (int64_t i = 1; i < iters; i++) {
+			ks_hmac_raw((const unsigned char *)p->data, (size_t)p->len, u, 32, u);
+			for (int j = 0; j < 32; j++) t[j] ^= u[j];
+		}
+		int64_t take = len - done < 32 ? len - done : 32;
+		memcpy(out + done, t, (size_t)take);
+		done += take;
+	}
+	free(msg);
+	return r;
+}
+
+KS_RT bool ks_constant_time_eq(ks_obj *ao, ks_obj *bo) {
+	ks_str *a = KS_S(ao), *b = KS_S(bo);
+	if (a->len != b->len) return false;
+	volatile unsigned char diff = 0;
+	for (int64_t i = 0; i < a->len; i++) diff |= (unsigned char)(a->data[i] ^ b->data[i]);
+	return diff == 0;
+}
+
+KS_RT ks_obj *ks_hex(ks_obj *so) {
+	static const char digits[] = "0123456789abcdef";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 2) ks_panic("string too long");
+	char *d;
+	ks_obj *r = ks_str_alloc(s->len * 2, &d);
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		d[2 * i] = digits[c >> 4];
+		d[2 * i + 1] = digits[c & 15];
+	}
+	return r;
+}
+
+KS_RT int ks_hexval(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+KS_RT ks_obj *ks_res_ok_obj(ks_obj *v);
+__attribute__((unused, format(printf, 1, 2))) static ks_obj *ks_res_errf(const char *fmt, ...);
+
+KS_RT ks_obj *ks_unhex(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	if (s->len % 2 != 0) return ks_res_errf("unhex: odd length %" PRId64, s->len);
+	char *d;
+	ks_obj *r = ks_str_alloc(s->len / 2, &d);
+	for (int64_t i = 0; i < s->len; i += 2) {
+		int hi = ks_hexval(s->data[i]), lo = ks_hexval(s->data[i + 1]);
+		if (hi < 0 || lo < 0) {
+			ks_release(r);
+			return ks_res_errf("unhex: invalid hex digit at byte %" PRId64, hi < 0 ? i : i + 1);
+		}
+		d[i / 2] = (char)(hi << 4 | lo);
+	}
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_base64_enc(ks_obj *so, bool url) {
+	const char *alpha = url ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	                        : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 4 * 3 - 3) ks_panic("string too long");
+	int64_t full = (s->len + 2) / 3 * 4;
+	int64_t outlen = url ? (s->len / 3 * 4 + (s->len % 3 == 0 ? 0 : s->len % 3 + 1)) : full;
+	char *d;
+	ks_obj *r = ks_str_alloc(outlen, &d);
+	const unsigned char *p = (const unsigned char *)s->data;
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i += 3) {
+		uint32_t v = (uint32_t)p[i] << 16;
+		int64_t rem = s->len - i;
+		if (rem > 1) v |= (uint32_t)p[i + 1] << 8;
+		if (rem > 2) v |= p[i + 2];
+		d[w++] = alpha[(v >> 18) & 63];
+		d[w++] = alpha[(v >> 12) & 63];
+		if (rem > 1) d[w++] = alpha[(v >> 6) & 63];
+		else if (!url) d[w++] = '=';
+		if (rem > 2) d[w++] = alpha[v & 63];
+		else if (!url) d[w++] = '=';
+	}
+	return r;
+}
+
+KS_RT ks_obj *ks_base64(ks_obj *s) { return ks_base64_enc(s, false); }
+KS_RT ks_obj *ks_base64url(ks_obj *s) { return ks_base64_enc(s, true); }
+
+KS_RT int ks_b64val(char c) {
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+' || c == '-') return 62;
+	if (c == '/' || c == '_') return 63;
+	return -1;
+}
+
+// ks_unbase64 accepts the standard and URL-safe alphabets, with or without
+// padding. Whitespace and any other byte are errors.
+KS_RT ks_obj *ks_unbase64(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	int64_t n = s->len;
+	while (n > 0 && s->data[n - 1] == '=' && s->len - n < 2) n--;
+	if (n % 4 == 1) return ks_res_errf("unbase64: invalid length");
+	if (s->len != n && s->len % 4 != 0) return ks_res_errf("unbase64: invalid padding");
+	char *d;
+	ks_obj *r = ks_str_alloc(n / 4 * 3 + (n % 4 == 0 ? 0 : n % 4 - 1), &d);
+	int64_t w = 0;
+	uint32_t acc = 0;
+	int bits = 0;
+	for (int64_t i = 0; i < n; i++) {
+		int v = ks_b64val(s->data[i]);
+		if (v < 0) {
+			ks_release(r);
+			return ks_res_errf("unbase64: invalid character at byte %" PRId64, i);
+		}
+		acc = acc << 6 | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			d[w++] = (char)(acc >> bits);
+			acc &= (1u << bits) - 1;
+		}
+	}
+	if (acc != 0) {
+		ks_release(r);
+		return ks_res_errf("unbase64: non-zero trailing bits");
+	}
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_url_encode(ks_obj *so) {
+	static const char digits[] = "0123456789ABCDEF";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 3) ks_panic("string too long");
+	char *buf = ks_alloc((size_t)s->len * 3 + 1);
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+			buf[w++] = (char)c;
+		} else {
+			buf[w++] = '%';
+			buf[w++] = digits[c >> 4];
+			buf[w++] = digits[c & 15];
+		}
+	}
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return r;
+}
+
+// ks_url_decode decodes %XX escapes and turns + into a space, as in query
+// strings and form bodies.
+KS_RT ks_obj *ks_url_decode(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	char *buf = ks_alloc((size_t)s->len + 1);
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i++) {
+		char c = s->data[i];
+		if (c == '+') {
+			buf[w++] = ' ';
+		} else if (c == '%') {
+			int hi = -1, lo = -1;
+			if (i + 2 < s->len) {
+				hi = ks_hexval(s->data[i + 1]);
+				lo = ks_hexval(s->data[i + 2]);
+			}
+			if (hi < 0 || lo < 0) {
+				free(buf);
+				return ks_res_errf("url_decode: invalid escape at byte %" PRId64, i);
+			}
+			buf[w++] = (char)(hi << 4 | lo);
+			i += 2;
+		} else {
+			buf[w++] = c;
+		}
+	}
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_res_ok_i64(int64_t v);
+KS_RT ks_obj *ks_res_ok_f64(double v);
+KS_RT ks_obj *ks_res_ok_bool(bool v);
+// JSON: documents stay strings. Each call validates the whole document and
+// walks a dotted path ("user.tags.0") to one value. Object keys are matched
+// exactly (the first of duplicate keys wins); array steps are decimal indexes.
+typedef struct {
+	const char *p;
+	const char *start;
+	const char *end;
+	int depth;
+} ks_jp;
+
+KS_RT void ks_jws(ks_jp *j) {
+	while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++;
+}
+
+// ks_jstring parses a string at j->p. If out is not NULL it receives the
+// decoded bytes (out must have room for the raw length).
+KS_RT bool ks_jstring(ks_jp *j, char *out, int64_t *outlen) {
+	if (j->p >= j->end || *j->p != '"') return false;
+	j->p++;
+	int64_t w = 0;
+	while (j->p < j->end) {
+		unsigned char c = (unsigned char)*j->p++;
+		if (c == '"') {
+			if (outlen) *outlen = w;
+			return true;
+		}
+		if (c < 0x20) return false;
+		if (c != '\\') {
+			if (out) out[w] = (char)c;
+			w++;
+			continue;
+		}
+		if (j->p >= j->end) return false;
+		char e = *j->p++;
+		char ch;
+		switch (e) {
+		case '"': ch = '"'; break;
+		case '\\': ch = '\\'; break;
+		case '/': ch = '/'; break;
+		case 'b': ch = '\b'; break;
+		case 'f': ch = '\f'; break;
+		case 'n': ch = '\n'; break;
+		case 'r': ch = '\r'; break;
+		case 't': ch = '\t'; break;
+		case 'u': {
+			uint32_t cp = 0;
+			for (int k = 0; k < 4; k++) {
+				if (j->p >= j->end) return false;
+				int v = ks_hexval(*j->p++);
+				if (v < 0) return false;
+				cp = cp << 4 | (uint32_t)v;
+			}
+			if (cp >= 0xd800 && cp <= 0xdbff && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+				uint32_t lo = 0;
+				bool okhex = true;
+				for (int k = 0; k < 4; k++) {
+					int v = ks_hexval(j->p[2 + k]);
+					if (v < 0) okhex = false;
+					lo = lo << 4 | (uint32_t)(v < 0 ? 0 : v);
+				}
+				if (okhex && lo >= 0xdc00 && lo <= 0xdfff) {
+					j->p += 6;
+					cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+				}
+			}
+			if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+			unsigned char buf[4];
+			int n;
+			if (cp < 0x80) { buf[0] = (unsigned char)cp; n = 1; }
+			else if (cp < 0x800) { buf[0] = (unsigned char)(0xc0 | cp >> 6); buf[1] = (unsigned char)(0x80 | (cp & 0x3f)); n = 2; }
+			else if (cp < 0x10000) { buf[0] = (unsigned char)(0xe0 | cp >> 12); buf[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f)); buf[2] = (unsigned char)(0x80 | (cp & 0x3f)); n = 3; }
+			else { buf[0] = (unsigned char)(0xf0 | cp >> 18); buf[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3f)); buf[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f)); buf[3] = (unsigned char)(0x80 | (cp & 0x3f)); n = 4; }
+			for (int k = 0; k < n; k++) {
+				if (out) out[w] = (char)buf[k];
+				w++;
+			}
+			continue;
+		}
+		default: return false;
+		}
+		if (out) out[w] = ch;
+		w++;
+	}
+	return false;
+}
+
+KS_RT bool ks_jnumber(ks_jp *j, bool *integer) {
+	const char *p = j->p;
+	*integer = true;
+	if (p < j->end && *p == '-') p++;
+	if (p >= j->end) return false;
+	if (*p == '0') p++;
+	else if (*p >= '1' && *p <= '9') { while (p < j->end && ks_is_digit(*p)) p++; }
+	else return false;
+	if (p < j->end && *p == '.') {
+		*integer = false;
+		p++;
+		if (p >= j->end || !ks_is_digit(*p)) return false;
+		while (p < j->end && ks_is_digit(*p)) p++;
+	}
+	if (p < j->end && (*p == 'e' || *p == 'E')) {
+		*integer = false;
+		p++;
+		if (p < j->end && (*p == '+' || *p == '-')) p++;
+		if (p >= j->end || !ks_is_digit(*p)) return false;
+		while (p < j->end && ks_is_digit(*p)) p++;
+	}
+	j->p = p;
+	return true;
+}
+
+KS_RT bool ks_jlit(ks_jp *j, const char *lit) {
+	size_t n = strlen(lit);
+	if ((size_t)(j->end - j->p) < n || memcmp(j->p, lit, n) != 0) return false;
+	j->p += n;
+	return true;
+}
+
+KS_RT bool ks_jskip(ks_jp *j) {
+	ks_jws(j);
+	if (j->p >= j->end) return false;
+	char c = *j->p;
+	if (c == '"') return ks_jstring(j, NULL, NULL);
+	if (c == 't') return ks_jlit(j, "true");
+	if (c == 'f') return ks_jlit(j, "false");
+	if (c == 'n') return ks_jlit(j, "null");
+	if (c == '{' || c == '[') {
+		if (++j->depth > 512) return false;
+		char close = c == '{' ? '}' : ']';
+		j->p++;
+		ks_jws(j);
+		if (j->p < j->end && *j->p == close) {
+			j->p++;
+			j->depth--;
+			return true;
+		}
+		for (;;) {
+			if (c == '{') {
+				ks_jws(j);
+				if (!ks_jstring(j, NULL, NULL)) return false;
+				ks_jws(j);
+				if (j->p >= j->end || *j->p != ':') return false;
+				j->p++;
+			}
+			if (!ks_jskip(j)) return false;
+			ks_jws(j);
+			if (j->p >= j->end) return false;
+			if (*j->p == ',') { j->p++; continue; }
+			if (*j->p == close) { j->p++; j->depth--; return true; }
+			return false;
+		}
+	}
+	bool integer;
+	return ks_jnumber(j, &integer);
+}
+
+KS_RT bool ks_jvalid_raw(ks_str *s, int64_t *errpos) {
+	ks_jp j = {s->data, s->data, s->data + s->len, 0};
+	bool ok = ks_jskip(&j);
+	if (ok) {
+		ks_jws(&j);
+		ok = j.p == j.end;
+	}
+	if (!ok && errpos) *errpos = (int64_t)(j.p - j.start);
+	return ok;
+}
+
+KS_RT bool ks_json_valid(ks_obj *doc) {
+	return ks_jvalid_raw(KS_S(doc), NULL);
+}
+
+// ks_jfind validates doc and positions *out at the value for path. On
+// failure it returns an error result; on success NULL.
+KS_RT ks_obj *ks_jfind(ks_obj *doco, ks_obj *patho, ks_jp *out, bool single_key) {
+	ks_str *doc = KS_S(doco), *path = KS_S(patho);
+	int64_t bad = 0;
+	if (!ks_jvalid_raw(doc, &bad)) return ks_res_errf("json: invalid document at byte %" PRId64, bad);
+	ks_jp j = {doc->data, doc->data, doc->data + doc->len, 0};
+	ks_jws(&j);
+	int64_t i = 0;
+	while ((single_key || path->len > 0) && i <= path->len) {
+		int64_t segend = i;
+		if (single_key) segend = path->len;
+		else while (segend < path->len && path->data[segend] != '.') segend++;
+		const char *seg = path->data + i;
+		int64_t seglen = segend - i;
+		ks_jws(&j);
+		if (*j.p == '{') {
+			j.p++;
+			bool found = false;
+			ks_jws(&j);
+			while (*j.p != '}') {
+				ks_jws(&j);
+				const char *ks = j.p;
+				int64_t klen = 0;
+				char *key = ks_alloc((size_t)(j.end - ks) + 1);
+				ks_jstring(&j, key, &klen);
+				bool match = klen == seglen && (seglen == 0 || memcmp(key, seg, (size_t)seglen) == 0);
+				free(key);
+				ks_jws(&j);
+				j.p++;
+				ks_jws(&j);
+				if (match) {
+					found = true;
+					break;
+				}
+				ks_jskip(&j);
+				ks_jws(&j);
+				if (*j.p == ',') j.p++;
+				ks_jws(&j);
+			}
+			if (!found) return ks_res_errf("json: no key \"%.*s\" at \"%.*s\"", (int)(seglen > 100 ? 100 : seglen), seg, (int)(i > 0 ? i - 1 : 0), path->data);
+		} else if (*j.p == '[') {
+			int64_t idx = 0;
+			if (seglen == 0 || seglen > 18) return ks_res_errf("json: \"%.*s\" is not an array index", (int)(seglen > 100 ? 100 : seglen), seg);
+			for (int64_t k = 0; k < seglen; k++) {
+				if (!ks_is_digit(seg[k])) return ks_res_errf("json: \"%.*s\" is not an array index", (int)(seglen > 100 ? 100 : seglen), seg);
+				idx = idx * 10 + (seg[k] - '0');
+			}
+			j.p++;
+			ks_jws(&j);
+			int64_t at = 0;
+			bool found = false;
+			while (*j.p != ']') {
+				if (at == idx) {
+					found = true;
+					break;
+				}
+				ks_jskip(&j);
+				ks_jws(&j);
+				if (*j.p == ',') j.p++;
+				ks_jws(&j);
+				at++;
+			}
+			if (!found) return ks_res_errf("json: index %" PRId64 " out of range (length %" PRId64 ")", idx, at);
+		} else {
+			return ks_res_errf("json: cannot look up \"%.*s\" in a value that is not an object or array", (int)(seglen > 100 ? 100 : seglen), seg);
+		}
+		if (single_key) break;
+		i = segend + 1;
+	}
+	ks_jws(&j);
+	*out = j;
+	return NULL;
+}
+
+KS_RT const char *ks_jkind(char c) {
+	switch (c) {
+	case '{': return "object";
+	case '[': return "array";
+	case '"': return "string";
+	case 't': case 'f': return "bool";
+	case 'n': return "null";
+	}
+	return "number";
+}
+
+KS_RT ks_obj *ks_json_type(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) {
+		ks_release(e);
+		return ks_str_from("", 0);
+	}
+	return ks_str_cstr(ks_jkind(*j.p));
+}
+
+KS_RT ks_obj *ks_jwrong(ks_obj *path, ks_jp *j, const char *want) {
+	return ks_res_errf("json: \"%.100s\" is %s, not %s", KS_S(path)->data, ks_jkind(*j->p), want);
+}
+
+KS_RT ks_obj *ks_json_string(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '"') return ks_jwrong(path, &j, "a string");
+	char *buf = ks_alloc((size_t)(j.end - j.p) + 1);
+	int64_t n = 0;
+	ks_jstring(&j, buf, &n);
+	ks_obj *r = ks_str_from(buf, n);
+	free(buf);
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_json_int(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	const char *start = j.p;
+	bool integer = false;
+	if (strcmp(ks_jkind(*j.p), "number") != 0 || !ks_jnumber(&j, &integer)) return ks_jwrong(path, &j, "an integer");
+	if (!integer) return ks_res_errf("json: \"%.100s\" is not an integer", KS_S(path)->data);
+	ks_obj *num = ks_str_from(start, (int64_t)(j.p - start));
+	int64_t v;
+	bool ok = ks_parse_int_raw(num, &v);
+	ks_release(num);
+	if (!ok) return ks_res_errf("json: \"%.100s\" does not fit in an int", KS_S(path)->data);
+	return ks_res_ok_i64(v);
+}
+
+KS_RT ks_obj *ks_json_float(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	const char *start = j.p;
+	bool integer;
+	if (strcmp(ks_jkind(*j.p), "number") != 0 || !ks_jnumber(&j, &integer)) return ks_jwrong(path, &j, "a number");
+	ks_obj *num = ks_str_from(start, (int64_t)(j.p - start));
+	double v = strtod(KS_S(num)->data, NULL);
+	ks_release(num);
+	return ks_res_ok_f64(v);
+}
+
+KS_RT ks_obj *ks_json_bool(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p == 't') return ks_res_ok_bool(true);
+	if (*j.p == 'f') return ks_res_ok_bool(false);
+	return ks_jwrong(path, &j, "a bool");
+}
+
+KS_RT ks_obj *ks_jraw_at(ks_jp *j) {
+	const char *start = j->p;
+	ks_jskip(j);
+	return ks_res_ok_obj(ks_str_from(start, (int64_t)(j->p - start)));
+}
+
+KS_RT ks_obj *ks_json_raw(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	return ks_jraw_at(&j);
+}
+
+KS_RT ks_obj *ks_json_member(ks_obj *doc, ks_obj *key) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, key, &j, true);
+	if (e != NULL) return e;
+	return ks_jraw_at(&j);
+}
+
+// ks_jitems walks the array or object at j and returns its length, pushing
+// decoded keys onto keys when it is not NULL.
+KS_RT int64_t ks_jitems(ks_jp *j, ks_obj *keys) {
+	char open = *j->p;
+	char close = open == '{' ? '}' : ']';
+	j->p++;
+	ks_jws(j);
+	int64_t n = 0;
+	while (*j->p != close) {
+		if (open == '{') {
+			char *buf = ks_alloc((size_t)(j->end - j->p) + 1);
+			int64_t klen = 0;
+			ks_jstring(j, buf, &klen);
+			if (keys) ks_arr_obj_push(keys, ks_str_from(buf, klen));
+			free(buf);
+			ks_jws(j);
+			j->p++;
+		}
+		ks_jskip(j);
+		ks_jws(j);
+		if (*j->p == ',') j->p++;
+		ks_jws(j);
+		n++;
+	}
+	return n;
+}
+
+KS_RT ks_obj *ks_json_len(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '{' && *j.p != '[') return ks_jwrong(path, &j, "an array or object");
+	return ks_res_ok_i64(ks_jitems(&j, NULL));
+}
+
+KS_RT ks_obj *ks_json_keys(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '{') return ks_jwrong(path, &j, "an object");
+	ks_obj *keys = ks_arr_obj_new(0);
+	ks_jitems(&j, keys);
+	return ks_res_ok_obj(keys);
+}
+
+KS_RT ks_obj *ks_json_quote(ks_obj *so) {
+	static const char digits[] = "0123456789abcdef";
+	ks_str *s = KS_S(so);
+	if (s->len > (INT64_MAX - 2) / 6) ks_panic("string too long");
+	char *buf = ks_alloc((size_t)s->len * 6 + 3);
+	int64_t w = 0;
+	buf[w++] = '"';
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		switch (c) {
+		case '"': buf[w++] = '\\'; buf[w++] = '"'; break;
+		case '\\': buf[w++] = '\\'; buf[w++] = '\\'; break;
+		case '\n': buf[w++] = '\\'; buf[w++] = 'n'; break;
+		case '\r': buf[w++] = '\\'; buf[w++] = 'r'; break;
+		case '\t': buf[w++] = '\\'; buf[w++] = 't'; break;
+		case '\b': buf[w++] = '\\'; buf[w++] = 'b'; break;
+		case '\f': buf[w++] = '\\'; buf[w++] = 'f'; break;
+		default:
+			if (c < 0x20 || c == 0x7f) {
+				buf[w++] = '\\'; buf[w++] = 'u'; buf[w++] = '0'; buf[w++] = '0';
+				buf[w++] = digits[c >> 4]; buf[w++] = digits[c & 15];
+			} else {
+				buf[w++] = (char)c;
+			}
+		}
+	}
+	buf[w++] = '"';
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return r;
 }
 
 typedef struct {
@@ -1195,8 +2231,30 @@ var mapInsts = []mapInst{
 }
 
 const mapHelpers = `
+static uint64_t ks_seed0, ks_seed1;
+
+// ks_init_seed picks the per-process hash key, so nobody outside the
+// process can choose map keys that collide.
+KS_RT void ks_init_seed(void) {
+	uint64_t k[2] = {0, 0};
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	bool ok = false;
+	if (fd >= 0) {
+		ok = read(fd, k, sizeof k) == (ssize_t)sizeof k;
+		close(fd);
+	}
+	if (!ok) {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		k[0] = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 20) ^ (uint64_t)(uintptr_t)&ts;
+		k[1] = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)ks_init_seed;
+	}
+	ks_seed0 = k[0];
+	ks_seed1 = k[1];
+}
+
 KS_RT uint64_t ks_hash_i64(int64_t k) {
-	uint64_t x = (uint64_t)k;
+	uint64_t x = (uint64_t)k ^ ks_seed0;
 	x ^= x >> 30;
 	x *= 0xbf58476d1ce4e5b9ULL;
 	x ^= x >> 27;
@@ -1205,14 +2263,47 @@ KS_RT uint64_t ks_hash_i64(int64_t k) {
 	return x;
 }
 
+#define KS_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define KS_SIPROUND \
+	do { \
+		v0 += v1; v1 = KS_ROTL(v1, 13); v1 ^= v0; v0 = KS_ROTL(v0, 32); \
+		v2 += v3; v3 = KS_ROTL(v3, 16); v3 ^= v2; \
+		v0 += v3; v3 = KS_ROTL(v3, 21); v3 ^= v0; \
+		v2 += v1; v1 = KS_ROTL(v1, 17); v1 ^= v2; v2 = KS_ROTL(v2, 32); \
+	} while (0)
+
+// SipHash-1-3 keyed with the per-process seed.
 KS_RT uint64_t ks_hash_str(ks_obj *o) {
 	ks_str *s = KS_S(o);
-	uint64_t h = 14695981039346656037ULL;
-	for (int64_t i = 0; i < s->len; i++) {
-		h ^= (unsigned char)s->data[i];
-		h *= 1099511628211ULL;
+	const unsigned char *in = (const unsigned char *)s->data;
+	size_t len = (size_t)s->len;
+	uint64_t v0 = 0x736f6d6570736575ULL ^ ks_seed0;
+	uint64_t v1 = 0x646f72616e646f6dULL ^ ks_seed1;
+	uint64_t v2 = 0x6c7967656e657261ULL ^ ks_seed0;
+	uint64_t v3 = 0x7465646279746573ULL ^ ks_seed1;
+	size_t whole = len - (len % 8);
+	for (size_t i = 0; i < whole; i += 8) {
+		uint64_t m;
+		memcpy(&m, in + i, 8);
+		v3 ^= m;
+		KS_SIPROUND;
+		v0 ^= m;
 	}
-	return h;
+	uint64_t b = ((uint64_t)len) << 56;
+	for (size_t i = 0; i < len % 8; i++) b |= ((uint64_t)in[whole + i]) << (8 * i);
+	v3 ^= b;
+	KS_SIPROUND;
+	v0 ^= b;
+	v2 ^= 0xff;
+	KS_SIPROUND;
+	KS_SIPROUND;
+	KS_SIPROUND;
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+
+KS_RT size_t ks_array_bytes(int64_t count, size_t size) {
+	if (count < 0 || (uint64_t)count > SIZE_MAX / size) ks_panic("map too large");
+	return (size_t)count * size;
 }
 `
 
@@ -1233,66 +2324,85 @@ func emitMap(m mapInst) string {
 }
 
 const mapTemplate = `
+// Maps keep insertion order: entries live in arrays in the order they were
+// added, and a power-of-two index table maps hashes to entry numbers.
+// Deleting marks an entry dead; its index slot keeps pointing at it as a
+// tombstone until the next rebuild compacts the entries.
 typedef struct {
 	ks_obj h;
 	int64_t len;
-	int64_t cap;
-	uint8_t *used;
+	int64_t n;
+	int64_t ecap;
+	uint8_t *alive;
 	KEYC *keys;
 	VALC *vals;
+	int64_t icap;
+	int64_t *index;
 } NAME;
 
 KS_RT void NAME_drop(ks_obj *o);
 KS_RT ks_obj *NAME_clone(ks_obj *o);
 
 KS_RT ks_obj *NAME_new(int64_t cap) {
-	if (cap < 8) cap = 8;
-	int64_t p2 = 8;
-	while (p2 < cap) {
-		if (p2 > INT64_MAX / 2) ks_panic("map too large");
-		p2 *= 2;
+	if (cap < 4) cap = 4;
+	int64_t icap = 8;
+	while (icap < cap * 2) {
+		if (icap > INT64_MAX / 4) ks_panic("map too large");
+		icap *= 2;
 	}
 	NAME *m = ks_alloc(sizeof *m);
 	ks_init_obj(&m->h, NAME_drop, NAME_clone);
 	m->len = 0;
-	m->cap = p2;
-	m->used = ks_alloc((size_t)p2);
-	memset(m->used, 0, (size_t)p2);
-	m->keys = ks_alloc((size_t)p2 * sizeof(KEYC));
-	m->vals = ks_alloc((size_t)p2 * sizeof(VALC));
+	m->n = 0;
+	m->ecap = cap;
+	m->alive = ks_alloc(ks_array_bytes(cap, 1));
+	m->keys = ks_alloc(ks_array_bytes(cap, sizeof(KEYC)));
+	m->vals = ks_alloc(ks_array_bytes(cap, sizeof(VALC)));
+	m->icap = icap;
+	m->index = ks_alloc(ks_array_bytes(icap, sizeof(int64_t)));
+	memset(m->index, 0, (size_t)icap * sizeof(int64_t));
 	return &m->h;
 }
 
 KS_RT void NAME_drop(ks_obj *o) {
 	NAME *m = (NAME *)o;
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		KEYC key = m->keys[i];
 		KEYRELEASE;
 		VALC v = m->vals[i];
 		VALRELEASE;
 	}
-	free(m->used);
+	free(m->alive);
 	free(m->keys);
 	free(m->vals);
+	free(m->index);
 	free(o);
+}
+
+KS_RT void NAME_place(NAME *m, int64_t e) {
+	KEYC key = m->keys[e];
+	int64_t mask = m->icap - 1;
+	int64_t i = (int64_t)(KEYHASH & (uint64_t)mask);
+	while (m->index[i] != 0) i = (i + 1) & mask;
+	m->index[i] = e + 1;
 }
 
 KS_RT ks_obj *NAME_clone(ks_obj *o) {
 	NAME *m = (NAME *)o;
-	ks_obj *r = NAME_new(m->cap);
+	ks_obj *r = NAME_new(m->len);
 	NAME *c = (NAME *)r;
-	c->len = m->len;
-	memcpy(c->used, m->used, (size_t)m->cap);
-	memcpy(c->keys, m->keys, (size_t)m->cap * sizeof(KEYC));
-	memcpy(c->vals, m->vals, (size_t)m->cap * sizeof(VALC));
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
-		KEYC key = c->keys[i];
-		c->keys[i] = KEYRETAIN;
-		VALC v = c->vals[i];
-		c->vals[i] = VALRETAIN;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
+		KEYC key = m->keys[i];
+		VALC v = m->vals[i];
+		int64_t e = c->n++;
+		c->keys[e] = KEYRETAIN;
+		c->vals[e] = VALRETAIN;
+		c->alive[e] = 1;
+		NAME_place(c, e);
 	}
+	c->len = c->n;
 	return r;
 }
 
@@ -1300,124 +2410,115 @@ KS_RT int64_t NAME_len(ks_obj *o) {
 	return ((NAME *)o)->len;
 }
 
-KS_RT int64_t NAME_find(NAME *m, KEYC key, bool *found) {
-	uint64_t h = KEYHASH;
-	int64_t mask = m->cap - 1;
-	int64_t i = (int64_t)(h & (uint64_t)mask);
-	int64_t tomb = -1;
-	for (int64_t n = 0; n < m->cap; n++) {
-		uint8_t u = m->used[i];
-		if (u == 0) { *found = false; return tomb >= 0 ? tomb : i; }
-		if (u == 2) {
-			if (tomb < 0) tomb = i;
-		} else {
-			KEYC a = m->keys[i];
+KS_RT int64_t NAME_find(NAME *m, KEYC key) {
+	int64_t mask = m->icap - 1;
+	int64_t i = (int64_t)(KEYHASH & (uint64_t)mask);
+	for (;;) {
+		int64_t e = m->index[i];
+		if (e == 0) return -1;
+		e--;
+		if (m->alive[e]) {
+			KEYC a = m->keys[e];
 			KEYC b = key;
-			if (KEYEQ) { *found = true; return i; }
+			if (KEYEQ) return e;
 		}
 		i = (i + 1) & mask;
 	}
-	*found = false;
-	if (tomb >= 0) return tomb;
-	ks_panic("map too large");
-	return 0;
 }
 
-KS_RT void NAME_grow(NAME *m) {
-	int64_t ncap = m->cap == 0 ? 8 : m->cap * 2;
-	if (m->cap > 0 && m->cap > INT64_MAX / 2) ks_panic("map too large");
-	uint8_t *used = ks_alloc((size_t)ncap);
-	memset(used, 0, (size_t)ncap);
-	KEYC *keys = ks_alloc((size_t)ncap * sizeof(KEYC));
-	VALC *vals = ks_alloc((size_t)ncap * sizeof(VALC));
-	uint8_t *oldu = m->used;
-	KEYC *oldk = m->keys;
-	VALC *oldv = m->vals;
-	int64_t ocap = m->cap;
-	m->used = used;
-	m->keys = keys;
-	m->vals = vals;
-	m->cap = ncap;
-	m->len = 0;
-	for (int64_t i = 0; i < ocap; i++) {
-		if (oldu[i] != 1) continue;
-		bool found = false;
-		int64_t slot = NAME_find(m, oldk[i], &found);
-		m->used[slot] = 1;
-		m->keys[slot] = oldk[i];
-		m->vals[slot] = oldv[i];
-		m->len++;
+// NAME_rebuild drops dead entries and rehashes into icap index slots.
+KS_RT void NAME_rebuild(NAME *m, int64_t icap) {
+	int64_t j = 0;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
+		m->keys[j] = m->keys[i];
+		m->vals[j] = m->vals[i];
+		m->alive[j] = 1;
+		j++;
 	}
-	free(oldu);
-	free(oldk);
-	free(oldv);
+	m->n = j;
+	free(m->index);
+	m->icap = icap;
+	m->index = ks_alloc(ks_array_bytes(icap, sizeof(int64_t)));
+	memset(m->index, 0, (size_t)icap * sizeof(int64_t));
+	for (int64_t e = 0; e < m->n; e++) NAME_place(m, e);
 }
 
 KS_RT void NAME_set(ks_obj *o, KEYC key, VALC val) {
 	NAME *m = (NAME *)o;
-	if (m->cap == 0 || (m->len + 1) * 4 > m->cap * 3) NAME_grow(m);
-	bool found = false;
-	int64_t i = NAME_find(m, key, &found);
-	if (found) {
-		VALC v = m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e >= 0) {
+		VALC v = m->vals[e];
 		VALRELEASE;
-		m->vals[i] = val;
+		m->vals[e] = val;
 		return;
 	}
-	m->used[i] = 1;
-	m->keys[i] = KEYRETAIN;
-	m->vals[i] = val;
+	if ((m->n + 1) * 4 > m->icap * 3) {
+		int64_t icap = m->icap;
+		while ((m->len + 1) * 2 > icap) {
+			if (icap > INT64_MAX / 4) ks_panic("map too large");
+			icap *= 2;
+		}
+		NAME_rebuild(m, icap);
+	}
+	if (m->n == m->ecap) {
+		if (m->ecap > INT64_MAX / 2) ks_panic("map too large");
+		int64_t ncap = m->ecap * 2;
+		m->alive = ks_realloc(m->alive, ks_array_bytes(ncap, 1));
+		m->keys = ks_realloc(m->keys, ks_array_bytes(ncap, sizeof(KEYC)));
+		m->vals = ks_realloc(m->vals, ks_array_bytes(ncap, sizeof(VALC)));
+		m->ecap = ncap;
+	}
+	e = m->n++;
+	m->keys[e] = KEYRETAIN;
+	m->vals[e] = val;
+	m->alive[e] = 1;
 	m->len++;
+	NAME_place(m, e);
 }
 
 KS_RT bool NAME_delete(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	if (m->cap == 0) return false;
-	bool found = false;
-	int64_t i = NAME_find(m, key, &found);
-	if (!found) return false;
+	int64_t e = NAME_find(m, key);
+	if (e < 0) return false;
 	{
-		KEYC key = m->keys[i];
+		KEYC key = m->keys[e];
 		KEYRELEASE;
-		VALC v = m->vals[i];
+		VALC v = m->vals[e];
 		VALRELEASE;
 	}
-	m->used[i] = 2;
+	m->alive[e] = 0;
 	m->len--;
+	if (m->len == 0) {
+		m->n = 0;
+		memset(m->index, 0, (size_t)m->icap * sizeof(int64_t));
+	}
 	return true;
 }
 
 KS_RT bool NAME_has(ks_obj *o, KEYC key) {
-	NAME *m = (NAME *)o;
-	if (m->cap == 0) return false;
-	bool found = false;
-	NAME_find(m, key, &found);
-	return found;
+	return NAME_find((NAME *)o, key) >= 0;
 }
 
 KS_RT VALC NAME_get(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	bool found = false;
-	int64_t i = 0;
-	if (m->cap != 0) i = NAME_find(m, key, &found);
-	if (!found) ks_panic("map key not found");
-	return m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e < 0) ks_panic("map key not found");
+	return m->vals[e];
 }
 
 KS_RT VALC *NAME_slot(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	bool found = false;
-	int64_t i = 0;
-	if (m->cap != 0) i = NAME_find(m, key, &found);
-	if (!found) ks_panic("map key not found");
-	return &m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e < 0) ks_panic("map key not found");
+	return &m->vals[e];
 }
 
 KS_RT ks_obj *NAME_keys(ks_obj *o) {
 	NAME *m = (NAME *)o;
 	ks_obj *a = ks_arr_KEYARR_new(m->len);
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		KEYC key = m->keys[i];
 		ks_arr_KEYARR_push(a, KEYRETAIN);
 	}
@@ -1427,8 +2528,8 @@ KS_RT ks_obj *NAME_keys(ks_obj *o) {
 KS_RT ks_obj *NAME_values(ks_obj *o) {
 	NAME *m = (NAME *)o;
 	ks_obj *a = ks_arr_VALARR_new(m->len);
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		VALC v = m->vals[i];
 		ks_arr_VALARR_push(a, VALRETAIN);
 	}

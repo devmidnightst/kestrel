@@ -1,4 +1,4 @@
-# Kestrel Language Specification (v0.3)
+# Kestrel Language Specification (v0.4)
 
 This document describes what the Kestrel compiler in this repository actually
 implements. Anything not listed here is not supported. Kestrel is a young
@@ -50,6 +50,13 @@ production track record, and this document makes no performance promises.
 
 There are no implicit conversions: `1 + 1.0` is an error; write
 `float(1) + 1.0`.
+
+Maps keep insertion order: `keys`, `values`, `for k in m` and `print` visit
+entries in the order their keys were first added. Assigning to an existing
+key keeps its place; deleting a key and adding it again moves it to the end.
+Keys are hashed with a key chosen randomly when the process starts
+(SipHash-1-3 for strings), so nobody outside the process can pick keys that
+collide and slow a map down.
 
 ### Value semantics
 
@@ -331,7 +338,7 @@ User functions may shadow builtin names.
 | `file_exists(path) -> bool` | true if the file can be opened for reading |
 | `tcp_listen(host, port) -> int` | listening socket, or `-1`. `port` 0 asks the operating system for a free port. One accept at a time; there is no concurrency |
 | `tcp_port(fd) -> int` | local port of a socket, or `-1` |
-| `tcp_accept(fd) -> int` | next connection, or `-1`. Blocks until a client connects |
+| `tcp_accept(fd) -> int` | next connection, or `-1`. Waits until a client connects (or a trapped signal arrives) |
 | `tcp_connect(host, port) -> int` | connected socket, or `-1` |
 | `tcp_read(fd, max) -> string` | one read of at most `max` bytes (capped at 1 MiB). `""` on end of stream or error |
 | `tcp_write(fd, data) -> int` | bytes written, or `-1` |
@@ -339,7 +346,7 @@ User functions may shadow builtin names.
 | `fmt(format, ...)` | replace each `{}` in a string. `{{` and `}}` are literal braces. A string literal is checked at compile time for hole syntax and argument count; a computed format is checked at run time and stops the program on a mismatch. Values must be int, float, bool or string, rendered the same way as `print`. Arrays, maps and structs are rejected (use `print`) |
 | `delete(place, key) -> bool` | remove `key` from a map held in a `var`. true if it was present. a missing key is left alone. same statement rule as `push` |
 | `has(m, key) -> bool` | true if the map contains `key` |
-| `keys(m) -> [K]` | the map's keys, in hash order |
+| `keys(m) -> [K]` | the map's keys, in insertion order |
 | `values(m) -> [V]` | the map's values, in the same order as `keys` |
 | `exit(code: int)` | flush standard output and exit immediately |
 | `assert(cond: bool, message: string)` | runtime error with the message if `cond` is false |
@@ -365,6 +372,34 @@ User functions may shadow builtin names.
 | `tcp_poll(fds: [int], timeout_ms: int) -> [int]` | wait until sockets are readable. Returns the ready ones (in input order), or `[]` after the timeout or when a signal arrives. `-1` waits forever. A listening socket is ready when a client is waiting; a connection is ready when `tcp_read` will not block, including at end of stream |
 | `tcp_set_timeout(fd, ms) -> bool` | read and write timeout for a socket; `0` clears it. A timed out `tcp_read` returns `""` and `tcp_write` returns `-1` |
 | `tcp_peer(fd) -> string` | remote address as `1.2.3.4:5678` or `[::1]:5678`, `""` on failure |
+| `tcp_wait(reads: [int], writes: [int], timeout_ms: int) -> [[int]]` | wait until any socket in `reads` can be read or any in `writes` can be written. Returns `[readable, writable]`, each in input order; both empty after the timeout or a signal. `-1` waits forever |
+| `tcp_try_accept(fd) -> int` | accept a waiting connection, or `-1` at once if none is waiting. Use it after `tcp_wait` reports the listener readable: another worker may have taken the connection |
+| `tcp_send(fd, data) -> int` | write as much of `data` as fits without blocking. Returns the bytes written (possibly fewer than `len(data)`, or `0` when the socket's buffer is full), or `-1` on error. Keep the rest and send it when `tcp_wait` reports the socket writable |
+| `tcp_connect_timeout(host, port, ms) -> int` | like `tcp_connect`, giving up on each address after `ms`. Name resolution itself still blocks; connect to addresses resolved at startup in latency-sensitive loops |
+| `fork_workers(n) -> int` | start `n` worker processes (1 to 1024) and return each worker's index, `0` to `n-1`, in that worker. The calling process becomes a supervisor and never returns: it restarts a worker that crashes or exits non-zero (pausing a second if it died within a second of starting), forwards `SIGTERM`/`SIGINT` to all workers, sends `SIGKILL` to any still running 30 seconds later, and exits 0 once all are gone. Sockets opened before the call are shared by every worker |
+| `cpu_count() -> int` | online CPUs, at least 1 |
+| `format_time(ms) -> string` | milliseconds since the epoch as RFC 3339 UTC: `2026-11-08T02:49:10.524Z` |
+| `random_bytes(n) -> string` | `n` bytes from the operating system's cryptographically secure generator. Stops the program if none is available rather than return weak randomness |
+| `random_int(low, high) -> int` | uniform secure random integer in `low..=high`; error if `low > high` |
+| `sha256(s) -> string` | the 32-byte SHA-256 digest (raw bytes; use `hex` to print it) |
+| `hmac_sha256(key, message) -> string` | the 32-byte HMAC-SHA-256 |
+| `pbkdf2_sha256(password, salt, iterations, length) -> string` | PBKDF2-HMAC-SHA-256 key derivation for password hashing. Use a random salt of 16 bytes and as many iterations as your latency allows (hundreds of thousands) |
+| `constant_time_eq(a, b) -> bool` | compare secrets (tokens, MACs, password hashes) in time that does not depend on where they differ |
+| `hex(s) -> string`, `unhex(s) -> !string` | lowercase hexadecimal encoding and decoding |
+| `base64(s)`, `base64url(s) -> string` | standard base64 with padding; URL-safe base64 without padding |
+| `unbase64(s) -> !string` | decodes either alphabet, with or without padding |
+| `url_encode(s) -> string` | percent-encodes everything except `A-Z a-z 0-9 - _ . ~` |
+| `url_decode(s) -> !string` | decodes `%XX` and turns `+` into a space (query strings and form bodies) |
+| `json_valid(doc) -> bool` | true if `doc` is one JSON value (RFC 8259), nested at most 512 deep |
+| `json_type(doc, path) -> string` | `"object"`, `"array"`, `"string"`, `"number"`, `"bool"` or `"null"`, or `""` if `doc` is invalid or `path` is missing |
+| `json_string(doc, path) -> !string` | the decoded string at `path` |
+| `json_int(doc, path) -> !int` | the integer at `path` (no fraction or exponent, must fit) |
+| `json_float(doc, path) -> !float`, `json_bool(doc, path) -> !bool` | the number or bool at `path` |
+| `json_len(doc, path) -> !int` | elements of the array, or members of the object, at `path` |
+| `json_keys(doc, path) -> ![string]` | member names of the object at `path`, in document order |
+| `json_raw(doc, path) -> !string` | the JSON text of the value at `path`, to pass on or look into later |
+| `json_member(doc, key) -> !string` | the JSON text of the top-level member named exactly `key`, for keys that contain `.` |
+| `json_quote(s) -> string` | `s` as a JSON string literal, quotes included, for building documents with `fmt` |
 
 `push` and `pop` change their first argument, so they may only be used as a
 statement or as the entire value of a `let`, `var` or assignment. Their first
@@ -372,39 +407,55 @@ argument must be a place rooted in a `var`.
 
 ### Serving many clients
 
-There are no threads. A server handles many connections at once from one
-thread with `tcp_poll`, the same readiness model as `poll(2)` based servers:
+There are no threads. A process handles many connections at once with
+`tcp_wait`, the readiness model of `poll(2)` based servers, and uses more
+CPU cores with `fork_workers`:
 
 ```
+let server = tcp_listen("0.0.0.0", 8080);
 trap_shutdown();
-var conns: [int] = [];
+let worker = fork_workers(cpu_count());     // every worker shares server
+var inbox: {int: string} = {};              // bytes received per connection
+var outbox: {int: string} = {};             // bytes still to send
 while !shutdown_requested() {
-    var watch = [server];
-    for c in conns { push(watch, c); }
-    for fd in tcp_poll(watch, 1000) {
+    var reads = [server];
+    var writes: [int] = [];
+    for fd in inbox {
+        if outbox[fd] == "" { push(reads, fd); } else { push(writes, fd); }
+    }
+    let ready = tcp_wait(reads, writes, 1000);
+    for fd in ready[0] {
         if fd == server {
-            push(conns, tcp_accept(server));   // check for -1 in real code
-        } else {
-            let data = tcp_read(fd, 4096);     // does not block: fd is ready
-            // ... "" means the client is gone: close it and drop it ...
+            let c = tcp_try_accept(server);   // -1 if another worker won
+            if c >= 0 { inbox[c] = ""; outbox[c] = ""; }
+            continue;
         }
+        let data = tcp_read(fd, 65536);       // never blocks: fd is ready
+        // "" means the client is gone: tcp_close it and delete it
+        // otherwise append to inbox[fd], and when a request is complete
+        // append the response to outbox[fd]
+    }
+    for fd in ready[1] {
+        let n = tcp_send(fd, outbox[fd]);     // never blocks
+        // n < 0: drop the connection; else keep what was not sent
     }
 }
 ```
 
-`examples/http/service.ks` is a complete HTTP service in this style with
-timeouts, logging and graceful shutdown. A connection that is ready to read
-never blocks `tcp_read`, but `tcp_write` can block on a client that stops
-reading; give each connection a `tcp_set_timeout`. To use more than one CPU
-core, run several processes that each call `tcp_listen_shared` on the same
-port.
+`examples/http/service.ks` is a complete HTTP service in this style, with
+keep-alive, request limits, idle timeouts, logging and graceful shutdown.
+`tcp_read` on a socket `tcp_wait` reported readable and `tcp_send` never
+block, so one slow client cannot stall the others. The blocking `tcp_write`
+is fine for simple programs; in a loop that serves many clients, use
+`tcp_send`. A runtime error stops only the worker it happens in; the
+supervisor starts a replacement.
 
 ### Signals
 
 By default `SIGTERM` and `SIGINT` end the program immediately, like any C
 program. After `trap_shutdown()` they set a flag instead: `shutdown_requested()`
-becomes true, and a blocking `tcp_accept`, `tcp_read`, `tcp_poll` or
-`sleep_ms` returns early (`-1`, `""`, `[]`) so the program can finish its
+becomes true, and a blocking `tcp_accept`, `tcp_read`, `tcp_poll`, `tcp_wait`
+or `sleep_ms` returns early (`-1`, `""`, `[]`) so the program can finish its
 loop, close its sockets and exit. This is what process managers such as
 systemd and Docker send when they stop a service, and a program running as
 PID 1 in a container is not killed by `SIGTERM` at all unless it handles it.
@@ -423,7 +474,10 @@ while !eof() {
 ## Runtime errors
 
 Runtime errors print `kestrel: runtime error: <reason>` to standard error,
-flush standard output, and exit immediately with status 101. They cover
+then a line `    at file.ks:12 in name` with the statement and function
+where it happened (the path is relative to the project root, and methods
+show as `Type.name`), flush standard output, and exit immediately with
+status 101. They cover
 integer overflow, division by zero, index and range errors, `pop` on an empty
 array, invalid `parse_int`/`parse_float` input, invalid conversions,
 unreadable files in `read_file`, `unwrap` of an error, failed `assert`s, out
@@ -460,6 +514,47 @@ import "lib/strings.ks" as s;    // s.fn(), s.Type
   fields of a visible struct are visible.
 - Modules are loaded once. Import cycles are errors.
 - There is no package manager and no search path.
+
+### Standard library
+
+`import "std:name";` loads a module that ships inside the compiler. Its
+module name is `name` unless `as` gives another. Standard library modules
+can import only other `std:` modules.
+
+`std:http` handles HTTP/1.1 messages; the program does the socket work:
+
+| function | description |
+|----------|-------------|
+| `http.frame(buf, max_body) -> int` | length of the first complete request at the start of `buf`, `0` if more bytes are needed, `-1` to reject it: a head over 16 KiB, a body over `max_body`, an invalid or conflicting `Content-Length`, or any `Transfer-Encoding` (chunked request bodies are not supported) |
+| `http.parse(raw) -> !http.request` | parse one framed request. Rejects malformed request lines, unsupported versions (only 1.0 and 1.1), lowercase or invalid methods, targets that do not start with `/` (or are not `*`), folded or invalid headers, control characters, and a missing `Host` on HTTP/1.1 |
+| `http.request` | struct with `method`, `target`, `path`, `query`, `version`, `headers` (`{string: string}`, lowercase names, repeated headers joined with `", "`), `body` and `keep_alive` (from the version and `Connection`) |
+| `http.header(req, name) -> string` | a header by case-insensitive name, or `""` |
+| `http.decode_path(path) -> !string` | percent-decode a path (keeps `+`) |
+| `http.query_params(query) -> {string: string}`, `http.query_param(query, name) -> string` | decode a query string or form body; the first of repeated names wins |
+| `http.response(code, headers, body, keep_alive) -> string` | a full response with `Content-Length` and `Connection` set. CR and LF in header names and values become spaces, so request data echoed into a header cannot inject another header |
+| `http.text(code, body, keep_alive)`, `http.json(code, body, keep_alive)` | `response` with `text/plain; charset=utf-8` or `application/json` |
+| `http.status_text(code) -> string` | the reason phrase |
+
+## Testing
+
+`kestrel test` compiles each `*_test.ks` file (the current directory,
+searched recursively, by default; hidden directories are skipped) and runs
+every function named `test_...` in it. A test takes no parameters and
+returns nothing or `!`. It passes if it returns normally (or returns
+`ok()`), and fails on a runtime error, a failed `assert`, or a returned
+error. Each test runs in its own process, so one failure cannot affect
+another, and runs in the test file's directory. `--run text` selects tests
+whose names contain `text`; `KESTREL_TEST_TIMEOUT` (seconds, default 60)
+limits each test. `--sanitize` checks every test for memory errors and
+leaks. The command exits 1 if any test fails.
+
+```
+fn test_parse_port() -> ! {
+    let n = try try_parse_int("8080");
+    assert(n == 8080, "port");
+    return ok();
+}
+```
 
 ## C header imports
 
@@ -517,7 +612,9 @@ Generics, closures and first-class functions, interfaces, enums,
 tuples, optional types, exceptions, typed errors (errors are messages),
 compound assignment (`+=`), global variables and constants, string indexing
 by character, Unicode-aware string operations, deep equality on arrays and
-structs, threads, async I/O beyond `tcp_poll`, TLS (put a reverse proxy such
-as Caddy or nginx in front), UDP, an HTTP library, directory operations,
-setting environment variables, Go package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
+structs, threads (concurrency is `tcp_wait` plus worker processes), non-blocking
+name resolution, TLS (put a reverse proxy such as Caddy or nginx in front),
+HTTP/2, chunked request bodies, an HTTP client, UDP, database drivers, a JSON
+tree type (JSON is read by path), directory operations, subprocesses, setting
+environment variables, Go package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
 `{:.2}` and no `{0}`).

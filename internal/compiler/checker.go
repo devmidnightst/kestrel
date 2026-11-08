@@ -42,7 +42,7 @@ func CheckSource(file string, src []byte) (*Program, error) {
 	if len(f.Imports) > 0 {
 		return nil, ErrorList{errorf(f.Imports[0].Pos, "module imports require a file on disk; use Load")}
 	}
-	m := &Module{Path: file, Display: file, File: f, Imports: map[string]*Module{}}
+	m := &Module{Path: file, Display: file, Rel: file, File: f, Imports: map[string]*Module{}}
 	for _, ci := range f.CImports {
 		if err := validateHeader(ci.Header); err != nil {
 			return nil, ErrorList{errorf(ci.HdrPos, "%v", err)}
@@ -53,6 +53,10 @@ func CheckSource(file string, src []byte) (*Program, error) {
 }
 
 func Check(modules []*Module, entry *Module) (*Program, error) {
+	return check(modules, entry, false)
+}
+
+func check(modules []*Module, entry *Module, test bool) (*Program, error) {
 	c := &checker{
 		info: &Info{
 			Types:    map[Expr]Type{},
@@ -86,6 +90,22 @@ func Check(modules []*Module, entry *Module) (*Program, error) {
 	}
 	prog := &Program{Modules: modules, Structs: c.structs, Entry: entry, Info: c.info}
 	main := entry.Funcs["main"]
+	if test {
+		for _, fn := range entry.Order {
+			if fn.Extern || fn.Recv != nil || !strings.HasPrefix(fn.Name, "test_") {
+				continue
+			}
+			if len(fn.Params) != 0 || (fn.Result != Void && fn.Result != ResultOf(Void) && fn.Result != Invalid) {
+				c.errorf(fn.Decl.NamePos, "test function %s must take no parameters and return nothing or !", fn.Name)
+				continue
+			}
+			prog.Tests = append(prog.Tests, fn)
+		}
+		if len(c.errs) > 0 {
+			return nil, c.errs.sorted()
+		}
+		return prog, nil
+	}
 	switch {
 	case main == nil:
 		c.errorf(Pos{File: entry.Display, Line: 1, Col: 1}, "entry file has no function main")

@@ -72,11 +72,16 @@ func GenerateC(prog *Program) string {
 	}
 	sb.WriteString(g.printDefs.String())
 	sb.WriteString(body.String())
+	if prog.Tests != nil || prog.Main == nil {
+		g.testMain(&sb, prog)
+		return sb.String()
+	}
 	sb.WriteString("\nint main(int argc, char **argv) {\n")
 	sb.WriteString("\tks_argc = argc;\n\tks_argv = argv;\n")
 	sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
 	sb.WriteString("\tsetvbuf(stderr, NULL, _IOLBF, BUFSIZ);\n")
 	sb.WriteString("\tks_init_stack((uintptr_t)__builtin_frame_address(0));\n")
+	sb.WriteString("\tks_init_seed();\n")
 	if prog.Main.Result.Kind == KResult {
 		fmt.Fprintf(&sb, "\tks_obj *ks_rc = %s();\n\tfflush(stdout);\n\treturn ks_main_result(ks_rc);\n", prog.Main.CName)
 	} else if prog.Main.Result == IntType {
@@ -243,7 +248,7 @@ func (g *gen) printFn(t Type) string {
 	} else if t.Kind == KMap {
 		k := mapKind(t)
 		fmt.Fprintf(&sb, "\tks_map_%s *m = (ks_map_%s *)v;\n\tfputc('{', out);\n", k, k)
-		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->cap; i++) {\n\t\tif (m->used[i] != 1) continue;\n\t\tif (shown++ > 0) fputs(\", \", out);\n")
+		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->n; i++) {\n\t\tif (!m->alive[i]) continue;\n\t\tif (shown++ > 0) fputs(\", \", out);\n")
 		fmt.Fprintf(&sb, "\t\t%s\n\t\tfputs(\": \", out);\n\t\t%s\n", g.printValue(t.Key, "m->keys[i]", "out", true), g.printValue(t.Elem, "m->vals[i]", "out", true))
 		sb.WriteString("\t}\n\tfputc('}', out);\n")
 	} else {
@@ -349,4 +354,41 @@ func intLiteral(v int64) string {
 		return "INT64_MIN"
 	}
 	return fmt.Sprintf("INT64_C(%d)", v)
+}
+
+// testMain runs each test function in a forked child, so a runtime error,
+// failed assert or returned error fails only that test. KESTREL_TEST_RUN
+// selects tests whose names contain it; KESTREL_TEST_TIMEOUT (seconds,
+// default 60) limits each one. The child exits through exit(), so leak
+// checking still runs in sanitized builds.
+func (g *gen) testMain(sb *strings.Builder, prog *Program) {
+	sb.WriteString("\nint main(int argc, char **argv) {\n")
+	sb.WriteString("\tks_argc = argc;\n\tks_argv = argv;\n")
+	sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n\tsetvbuf(stderr, NULL, _IOLBF, BUFSIZ);\n")
+	sb.WriteString("\tks_init_stack((uintptr_t)__builtin_frame_address(0));\n\tks_init_seed();\n")
+	sb.WriteString("\tconst char *filter = getenv(\"KESTREL_TEST_RUN\");\n")
+	sb.WriteString("\tconst char *tv = getenv(\"KESTREL_TEST_TIMEOUT\");\n\tunsigned timeout = tv != NULL && atoi(tv) > 0 ? (unsigned)atoi(tv) : 60;\n")
+	sb.WriteString("\tint passed = 0, failed = 0;\n")
+	for _, fn := range prog.Tests {
+		name := cString(fn.Name)
+		fmt.Fprintf(sb, "\tif (filter == NULL || strstr(%s, filter) != NULL) {\n", name)
+		sb.WriteString("\t\tfflush(stdout);\n\t\tfflush(stderr);\n\t\tint64_t t0 = ks_clock_ms();\n\t\tpid_t pid = fork();\n")
+		sb.WriteString("\t\tif (pid < 0) ks_panic(\"kestrel test: fork failed\");\n")
+		sb.WriteString("\t\tif (pid == 0) {\n\t\t\talarm(timeout);\n")
+		if fn.Result.Kind == KResult {
+			fmt.Fprintf(sb, "\t\t\tint code = ks_main_result(%s());\n\t\t\tfflush(stdout);\n\t\t\texit(code);\n", fn.CName)
+		} else {
+			fmt.Fprintf(sb, "\t\t\t%s();\n\t\t\tfflush(stdout);\n\t\t\texit(0);\n", fn.CName)
+		}
+		sb.WriteString("\t\t}\n\t\tint status = 0;\n\t\twhile (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}\n")
+		sb.WriteString("\t\tint64_t ms = ks_clock_ms() - t0;\n")
+		sb.WriteString("\t\tif (WIFEXITED(status) && WEXITSTATUS(status) == 0) {\n\t\t\tpassed++;\n")
+		fmt.Fprintf(sb, "\t\t\tprintf(\"ok   %%s (%%\" PRId64 \"ms)\\n\", %s, ms);\n", name)
+		sb.WriteString("\t\t} else {\n\t\t\tfailed++;\n")
+		fmt.Fprintf(sb, "\t\t\tif (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM) printf(\"FAIL %%s (timed out after %%us)\\n\", %s, timeout);\n", name)
+		fmt.Fprintf(sb, "\t\t\telse if (WIFSIGNALED(status)) printf(\"FAIL %%s (killed by signal %%d)\\n\", %s, WTERMSIG(status));\n", name)
+		fmt.Fprintf(sb, "\t\t\telse printf(\"FAIL %%s (exit status %%d)\\n\", %s, WEXITSTATUS(status));\n", name)
+		sb.WriteString("\t\t}\n\t}\n")
+	}
+	sb.WriteString("\tprintf(\"%d passed, %d failed\\n\", passed, failed);\n\treturn failed > 0 ? 1 : 0;\n}\n")
 }

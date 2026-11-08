@@ -18,6 +18,24 @@ type fnGen struct {
 	ntmp   int
 	scopes []*genScope
 	frames [][]string
+	fnName string
+	file   string
+	loc    string
+}
+
+// setLoc records the source position of the statement about to run, so a
+// runtime error can say where it happened. It costs one pointer store.
+func (f *fnGen) setLoc(p Pos) {
+	f.loc = cString(fmt.Sprintf("%s:%d in %s", f.file, p.Line, f.fnName))
+	f.line("ks_loc = %s;", f.loc)
+}
+
+// restoreLoc puts the current statement's position back after a call,
+// which set positions of its own.
+func (f *fnGen) restoreLoc() {
+	if f.loc != "" {
+		f.line("ks_loc = %s;", f.loc)
+	}
 }
 
 func (f *fnGen) line(format string, args ...any) {
@@ -58,6 +76,11 @@ func (f *fnGen) releaseScope(s *genScope) {
 func (f *fnGen) function(fn *Func) {
 	fmt.Fprintf(f.out, "\nstatic %s {\n", prototype(fn))
 	f.ind = 1
+	f.fnName = fn.Name
+	f.file = fn.Module.Rel
+	if fn.Recv != nil && fn.Recv.Type.Kind == KStruct {
+		f.fnName = fn.Recv.Type.Struct.Name + "." + fn.Name
+	}
 	f.line("ks_stack_check();")
 	if fn.Recv != nil {
 		f.line("(void)%s;", fn.Recv.CName)
@@ -104,6 +127,11 @@ func (f *fnGen) close() {
 
 func (f *fnGen) stmt(s Stmt) {
 	info := f.g.info
+	switch s.(type) {
+	case *BlockStmt, *BreakStmt, *ContinueStmt, *WhileStmt:
+	default:
+		f.setLoc(s.P())
+	}
 	switch s := s.(type) {
 	case *LetStmt:
 		v := info.Defs[s]
@@ -167,6 +195,7 @@ func (f *fnGen) stmt(s Stmt) {
 	case *WhileStmt:
 		f.line("while (1) {")
 		f.ind++
+		f.setLoc(s.Pos)
 		cond := f.condition(s.Cond)
 		f.line("if (!%s) break;", cond)
 		f.block(s.Body, true)
@@ -251,8 +280,8 @@ func (f *fnGen) forMap(s *ForStmt, outer *genScope, lab string) {
 	idx := f.temp("int64_t", "0")
 	f.line("while (1) {")
 	f.ind++
-	f.line("while (%s < %s->cap && %s->used[%s] != 1) %s++;", idx, m, m, idx, idx)
-	f.line("if (!(%s < %s->cap)) break;", idx, m)
+	f.line("while (%s < %s->n && !%s->alive[%s]) %s++;", idx, m, m, idx, idx)
+	f.line("if (!(%s < %s->n)) break;", idx, m)
 	f.blockGo(s.Body, true, lab, func(sc *genScope) {
 		v := info.Loops[s]
 		get := fmt.Sprintf("%s->keys[%s]", m, idx)
@@ -487,9 +516,16 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 		call := fmt.Sprintf("%s(%s)", name, strings.Join(args, ", "))
 		if fn.Result == Void {
 			f.line("%s;", call)
+			if !fn.Extern {
+				f.restoreLoc()
+			}
 			return "", false
 		}
-		return f.temp(cType(fn.Result), call), fn.Result.Managed()
+		r := f.temp(cType(fn.Result), call)
+		if !fn.Extern {
+			f.restoreLoc()
+		}
+		return r, fn.Result.Managed()
 	}
 	panic(fmt.Sprintf("unexpected expression %T", e))
 }
@@ -657,9 +693,12 @@ func (f *fnGen) methodCall(e *CallExpr, fn *Func) (string, bool) {
 	call := fmt.Sprintf("%s(%s)", fn.CName, strings.Join(args, ", "))
 	if fn.Result == Void {
 		f.line("%s;", call)
+		f.restoreLoc()
 		return "", false
 	}
-	return f.temp(cType(fn.Result), call), fn.Result.Managed()
+	r := f.temp(cType(fn.Result), call)
+	f.restoreLoc()
+	return r, fn.Result.Managed()
 }
 
 func (f *fnGen) stringify(e Expr) string {

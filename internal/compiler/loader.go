@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,7 +22,27 @@ type loader struct {
 
 var headerPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_./-]*\.h$`)
 
+// The standard library ships inside the compiler. import "std:http"; loads
+// std/http.ks; its module name is http.
+//
+//go:embed std/*.ks
+var stdFS embed.FS
+
+var stdPattern = regexp.MustCompile(`^std:[a-z][a-z0-9_]*$`)
+
+const stdPrefix = "std:"
+
 func Load(entry string) (*Program, error) {
+	return load(entry, false)
+}
+
+// LoadTests loads entry for kestrel test: main is optional, and the entry
+// file's test_ functions are collected in Program.Tests.
+func LoadTests(entry string) (*Program, error) {
+	return load(entry, true)
+}
+
+func load(entry string, test bool) (*Program, error) {
 	abs, err := filepath.Abs(entry)
 	if err != nil {
 		return nil, err
@@ -49,7 +70,7 @@ func Load(entry string) (*Program, error) {
 	if len(l.errs) > 0 {
 		return nil, l.errs.sorted()
 	}
-	return Check(l.order, main)
+	return check(l.order, main, test)
 }
 
 func (l *loader) display(real string) string {
@@ -65,7 +86,14 @@ func (l *loader) load(real string, chain []string) (*Module, error) {
 		return m, nil
 	}
 	disp := l.display(real)
-	src, err := os.ReadFile(real)
+	var src []byte
+	var err error
+	if strings.HasPrefix(real, stdPrefix) {
+		disp = real
+		src, err = stdFS.ReadFile("std/" + strings.TrimPrefix(real, stdPrefix) + ".ks")
+	} else {
+		src, err = os.ReadFile(real)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: %v", disp, err)
 	}
@@ -74,7 +102,13 @@ func (l *loader) load(real string, chain []string) (*Module, error) {
 		return nil, err
 	}
 	l.visiting[real] = true
-	m := &Module{Path: real, Display: disp, File: f, Imports: map[string]*Module{}}
+	rel := filepath.Base(real)
+	if strings.HasPrefix(real, stdPrefix) {
+		rel = real
+	} else if r, err := filepath.Rel(l.root, real); err == nil {
+		rel = filepath.ToSlash(r)
+	}
+	m := &Module{Path: real, Display: disp, Rel: rel, File: f, Imports: map[string]*Module{}}
 	for _, ci := range f.CImports {
 		if err := validateHeader(ci.Header); err != nil {
 			l.errs = append(l.errs, errorf(ci.HdrPos, "%v", err))
@@ -84,13 +118,17 @@ func (l *loader) load(real string, chain []string) (*Module, error) {
 	}
 	chain = append(chain, disp)
 	for _, imp := range f.Imports {
-		target, err := l.resolve(filepath.Dir(real), imp)
+		target, err := l.resolve(l.dirOf(real), imp)
 		if err != nil {
 			l.errs = append(l.errs, err.(*Error))
 			continue
 		}
 		alias := imp.Alias
 		aliasPos := imp.AliasPos
+		if alias == "" && strings.HasPrefix(imp.Path, stdPrefix) {
+			alias = strings.TrimPrefix(imp.Path, stdPrefix)
+			aliasPos = imp.PathPos
+		}
 		if alias == "" {
 			alias = strings.TrimSuffix(filepath.Base(imp.Path), ".ks")
 			aliasPos = imp.PathPos
@@ -120,8 +158,27 @@ func (l *loader) load(real string, chain []string) (*Module, error) {
 	return m, nil
 }
 
+func (l *loader) dirOf(real string) string {
+	if strings.HasPrefix(real, stdPrefix) {
+		return stdPrefix
+	}
+	return filepath.Dir(real)
+}
+
 func (l *loader) resolve(dir string, imp *Import) (string, error) {
 	p := imp.Path
+	if strings.HasPrefix(p, stdPrefix) {
+		if !stdPattern.MatchString(p) {
+			return "", errorf(imp.PathPos, "invalid standard library import %q (expected something like \"std:http\")", p)
+		}
+		if _, err := stdFS.ReadFile("std/" + strings.TrimPrefix(p, stdPrefix) + ".ks"); err != nil {
+			return "", errorf(imp.PathPos, "no standard library module %q", p)
+		}
+		return p, nil
+	}
+	if dir == stdPrefix {
+		return "", errorf(imp.PathPos, "standard library modules can only import other std: modules")
+	}
 	switch {
 	case p == "":
 		return "", errorf(imp.PathPos, "empty import path")
