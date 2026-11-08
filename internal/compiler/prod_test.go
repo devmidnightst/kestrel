@@ -226,3 +226,64 @@ func TestMapInsertionOrderStress(t *testing.T) {
 func itoa(n int) string {
 	return strconv.Itoa(n)
 }
+
+func TestCryptoAndEncoding(t *testing.T) {
+	requireCC(t)
+	src := `fn main() -> ! {
+    print(hex(sha256("abc")));
+    print(hex(sha256(join(fill("a", 1000000), ""))));
+    let x = "x";
+    print(hex(sha256(join(fill(x, 63), ""))), hex(sha256(join(fill(x, 64), ""))));
+    print(hex(sha256(join(fill(x, 55), ""))), hex(sha256(join(fill(x, 56), ""))));
+    print(hex(hmac_sha256("Jefe", "what do ya want for nothing?")));
+    print(hex(hmac_sha256(join(fill("k", 100), ""), "msg")));
+    print(hex(pbkdf2_sha256("password", "salt", 1, 32)));
+    print(hex(pbkdf2_sha256("password", "salt", 4096, 50)));
+    let raw = try unhex("fbff0068656c6c6f21");
+    print(base64(raw), base64url(raw), base64("ab"), base64(""));
+    print(unwrap(unbase64("+/8AaGVsbG8h")) == raw, unwrap(unbase64("-_8AaGVsbG8h")) == raw, unwrap(unbase64("YWI=")) == "ab", unwrap(unbase64("YWI")) == "ab");
+    print(unbase64("YW=I"), unbase64("Y"), unhex("abc"), unhex("zz"));
+    print(url_encode("a b&c=d/é~"), unwrap(url_decode("a+b%26c%3Dd%2F%C3%A9~")), url_decode("%4"), url_decode("%zz"));
+    print(constant_time_eq("secret", "secret"), constant_time_eq("secret", "secreT"), constant_time_eq("a", "ab"));
+    let r1 = random_bytes(32);
+    let r2 = random_bytes(32);
+    print(len(r1), r1 != r2, len(random_bytes(0)));
+    var lo = 100;
+    var hi = 0;
+    for i in 0..2000 {
+        let v = random_int(1, 6);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+    print(lo, hi, random_int(7, 7), random_int(-9223372036854775807 - 1, 9223372036854775807) == 0 || true);
+    return ok();
+}`
+	want := "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n" +
+		"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\n" +
+		"75220b47218278e656f2013bb8f0c455a25eaf01e86c64924e9d48d89776d6f2 7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c\n" +
+		"d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072 04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e\n" +
+		"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843\n" +
+		"bd56a1782c2830e8abc6ed866a57a1230661e650b84c62f7ee3accc5fa5af491\n" +
+		"120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b\n" +
+		"c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134af7ad98c1b458ce3fd74ca35beba3cda7b8d1\n" +
+		"+/8AaGVsbG8h -_8AaGVsbG8h YWI= \n" +
+		"true true true true\n" +
+		"err(\"unbase64: invalid character at byte 2\") err(\"unbase64: invalid length\") err(\"unhex: odd length 3\") err(\"unhex: invalid hex digit at byte 0\")\n" +
+		"a%20b%26c%3Dd%2F%C3%A9~ a b&c=d/é~ err(\"url_decode: invalid escape at byte 0\") err(\"url_decode: invalid escape at byte 0\")\n" +
+		"true false false\n" +
+		"32 true 0\n" +
+		"1 6 7 true\n"
+	for _, sanitize := range []bool{false, true} {
+		if sanitize {
+			requireSanitizers(t)
+		}
+		r := runWith(t, src, "", sanitize)
+		if r.code != 0 || r.stdout != want || r.stderr != "" {
+			t.Errorf("sanitize %v: exit %d, stderr %q\ngot:\n%s\nwant:\n%s", sanitize, r.code, r.stderr, r.stdout, want)
+		}
+	}
+	bad := runWith(t, "fn main() { print(random_int(5, 1)); }", "", false)
+	if bad.code != 101 || !strings.Contains(bad.stderr, "random_int: low 5 is greater than high 1") {
+		t.Errorf("random_int range: %d %q", bad.code, bad.stderr)
+	}
+}

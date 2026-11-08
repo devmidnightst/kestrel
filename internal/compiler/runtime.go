@@ -1226,6 +1226,378 @@ KS_RT int64_t ks_fork_workers(int64_t n) {
 	_Exit(0);
 }
 
+// ks_os_random fills buf from the kernel's CSPRNG and stops the program if
+// it cannot: a program that asked for secure random bytes must never get
+// predictable ones.
+KS_RT void ks_os_random(unsigned char *buf, size_t n) {
+	static int fd = -1;
+	if (fd < 0) {
+		fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+		if (fd < 0) ks_panicf("random: cannot open /dev/urandom: %s", strerror(errno));
+	}
+	size_t off = 0;
+	while (off < n) {
+		ssize_t r = read(fd, buf + off, n - off);
+		if (r < 0 && errno == EINTR) continue;
+		if (r <= 0) ks_panic("random: cannot read /dev/urandom");
+		off += (size_t)r;
+	}
+}
+
+KS_RT ks_obj *ks_random_bytes(int64_t n) {
+	if (n < 0 || n > (1 << 30)) ks_panicf("random_bytes: count %" PRId64 " must be 0 to 1073741824", n);
+	char *d;
+	ks_obj *r = ks_str_alloc(n, &d);
+	ks_os_random((unsigned char *)d, (size_t)n);
+	return r;
+}
+
+KS_RT int64_t ks_random_int(int64_t lo, int64_t hi) {
+	if (lo > hi) ks_panicf("random_int: low %" PRId64 " is greater than high %" PRId64, lo, hi);
+	uint64_t span = (uint64_t)hi - (uint64_t)lo;
+	uint64_t x;
+	if (span == UINT64_MAX) {
+		ks_os_random((unsigned char *)&x, sizeof x);
+		return (int64_t)x;
+	}
+	uint64_t range = span + 1;
+	uint64_t limit = UINT64_MAX - (UINT64_MAX % range);
+	do {
+		ks_os_random((unsigned char *)&x, sizeof x);
+	} while (x >= limit);
+	return (int64_t)((uint64_t)lo + x % range);
+}
+
+typedef struct {
+	uint32_t h[8];
+	uint64_t len;
+	unsigned char buf[64];
+	size_t fill;
+} ks_sha256;
+
+static const uint32_t ks_sha256_k[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+#define KS_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+KS_RT void ks_sha256_block(ks_sha256 *c, const unsigned char *p) {
+	uint32_t w[64];
+	for (int i = 0; i < 16; i++) {
+		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | (uint32_t)p[4 * i + 3];
+	}
+	for (int i = 16; i < 64; i++) {
+		uint32_t s0 = KS_ROR32(w[i - 15], 7) ^ KS_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		uint32_t s1 = KS_ROR32(w[i - 2], 17) ^ KS_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+	uint32_t a = c->h[0], b = c->h[1], cc = c->h[2], d = c->h[3], e = c->h[4], f = c->h[5], g = c->h[6], h = c->h[7];
+	for (int i = 0; i < 64; i++) {
+		uint32_t S1 = KS_ROR32(e, 6) ^ KS_ROR32(e, 11) ^ KS_ROR32(e, 25);
+		uint32_t ch = (e & f) ^ (~e & g);
+		uint32_t t1 = h + S1 + ch + ks_sha256_k[i] + w[i];
+		uint32_t S0 = KS_ROR32(a, 2) ^ KS_ROR32(a, 13) ^ KS_ROR32(a, 22);
+		uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+		uint32_t t2 = S0 + maj;
+		h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+	}
+	c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+	c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
+}
+
+KS_RT void ks_sha256_init(ks_sha256 *c) {
+	static const uint32_t iv[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+	memcpy(c->h, iv, sizeof iv);
+	c->len = 0;
+	c->fill = 0;
+}
+
+KS_RT void ks_sha256_update(ks_sha256 *c, const unsigned char *p, size_t n) {
+	c->len += (uint64_t)n;
+	while (n > 0) {
+		size_t take = 64 - c->fill;
+		if (take > n) take = n;
+		memcpy(c->buf + c->fill, p, take);
+		c->fill += take;
+		p += take;
+		n -= take;
+		if (c->fill == 64) {
+			ks_sha256_block(c, c->buf);
+			c->fill = 0;
+		}
+	}
+}
+
+KS_RT void ks_sha256_final(ks_sha256 *c, unsigned char out[32]) {
+	uint64_t bits = c->len * 8;
+	unsigned char pad = 0x80;
+	ks_sha256_update(c, &pad, 1);
+	unsigned char zero = 0;
+	while (c->fill != 56) ks_sha256_update(c, &zero, 1);
+	unsigned char lenb[8];
+	for (int i = 0; i < 8; i++) lenb[i] = (unsigned char)(bits >> (56 - 8 * i));
+	ks_sha256_update(c, lenb, 8);
+	for (int i = 0; i < 8; i++) {
+		out[4 * i] = (unsigned char)(c->h[i] >> 24);
+		out[4 * i + 1] = (unsigned char)(c->h[i] >> 16);
+		out[4 * i + 2] = (unsigned char)(c->h[i] >> 8);
+		out[4 * i + 3] = (unsigned char)c->h[i];
+	}
+}
+
+KS_RT ks_obj *ks_sha256_str(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	ks_sha256 c;
+	unsigned char out[32];
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, (const unsigned char *)s->data, (size_t)s->len);
+	ks_sha256_final(&c, out);
+	return ks_str_from((const char *)out, 32);
+}
+
+KS_RT void ks_hmac_raw(const unsigned char *key, size_t klen, const unsigned char *msg, size_t mlen, unsigned char out[32]) {
+	unsigned char k[64];
+	memset(k, 0, sizeof k);
+	if (klen > 64) {
+		ks_sha256 c;
+		ks_sha256_init(&c);
+		ks_sha256_update(&c, key, klen);
+		ks_sha256_final(&c, k);
+	} else if (klen > 0) {
+		memcpy(k, key, klen);
+	}
+	unsigned char ipad[64], opad[64], inner[32];
+	for (int i = 0; i < 64; i++) {
+		ipad[i] = k[i] ^ 0x36;
+		opad[i] = k[i] ^ 0x5c;
+	}
+	ks_sha256 c;
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, ipad, 64);
+	ks_sha256_update(&c, msg, mlen);
+	ks_sha256_final(&c, inner);
+	ks_sha256_init(&c);
+	ks_sha256_update(&c, opad, 64);
+	ks_sha256_update(&c, inner, 32);
+	ks_sha256_final(&c, out);
+}
+
+KS_RT ks_obj *ks_hmac_sha256(ks_obj *ko, ks_obj *mo) {
+	ks_str *k = KS_S(ko), *m = KS_S(mo);
+	unsigned char out[32];
+	ks_hmac_raw((const unsigned char *)k->data, (size_t)k->len, (const unsigned char *)m->data, (size_t)m->len, out);
+	return ks_str_from((const char *)out, 32);
+}
+
+KS_RT ks_obj *ks_pbkdf2_sha256(ks_obj *po, ks_obj *so, int64_t iters, int64_t len) {
+	if (iters < 1 || iters > 100000000) ks_panicf("pbkdf2_sha256: iterations %" PRId64 " must be 1 to 100000000", iters);
+	if (len < 1 || len > 1024) ks_panicf("pbkdf2_sha256: length %" PRId64 " must be 1 to 1024", len);
+	ks_str *p = KS_S(po), *s = KS_S(so);
+	if (s->len > (1 << 20)) ks_panic("pbkdf2_sha256: salt too long");
+	char *out;
+	ks_obj *r = ks_str_alloc(len, &out);
+	unsigned char *msg = ks_alloc((size_t)s->len + 4);
+	if (s->len > 0) memcpy(msg, s->data, (size_t)s->len);
+	int64_t done = 0;
+	for (uint32_t block = 1; done < len; block++) {
+		msg[s->len] = (unsigned char)(block >> 24);
+		msg[s->len + 1] = (unsigned char)(block >> 16);
+		msg[s->len + 2] = (unsigned char)(block >> 8);
+		msg[s->len + 3] = (unsigned char)block;
+		unsigned char u[32], t[32];
+		ks_hmac_raw((const unsigned char *)p->data, (size_t)p->len, msg, (size_t)s->len + 4, u);
+		memcpy(t, u, 32);
+		for (int64_t i = 1; i < iters; i++) {
+			ks_hmac_raw((const unsigned char *)p->data, (size_t)p->len, u, 32, u);
+			for (int j = 0; j < 32; j++) t[j] ^= u[j];
+		}
+		int64_t take = len - done < 32 ? len - done : 32;
+		memcpy(out + done, t, (size_t)take);
+		done += take;
+	}
+	free(msg);
+	return r;
+}
+
+KS_RT bool ks_constant_time_eq(ks_obj *ao, ks_obj *bo) {
+	ks_str *a = KS_S(ao), *b = KS_S(bo);
+	if (a->len != b->len) return false;
+	volatile unsigned char diff = 0;
+	for (int64_t i = 0; i < a->len; i++) diff |= (unsigned char)(a->data[i] ^ b->data[i]);
+	return diff == 0;
+}
+
+KS_RT ks_obj *ks_hex(ks_obj *so) {
+	static const char digits[] = "0123456789abcdef";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 2) ks_panic("string too long");
+	char *d;
+	ks_obj *r = ks_str_alloc(s->len * 2, &d);
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		d[2 * i] = digits[c >> 4];
+		d[2 * i + 1] = digits[c & 15];
+	}
+	return r;
+}
+
+KS_RT int ks_hexval(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+KS_RT ks_obj *ks_res_ok_obj(ks_obj *v);
+__attribute__((unused, format(printf, 1, 2))) static ks_obj *ks_res_errf(const char *fmt, ...);
+
+KS_RT ks_obj *ks_unhex(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	if (s->len % 2 != 0) return ks_res_errf("unhex: odd length %" PRId64, s->len);
+	char *d;
+	ks_obj *r = ks_str_alloc(s->len / 2, &d);
+	for (int64_t i = 0; i < s->len; i += 2) {
+		int hi = ks_hexval(s->data[i]), lo = ks_hexval(s->data[i + 1]);
+		if (hi < 0 || lo < 0) {
+			ks_release(r);
+			return ks_res_errf("unhex: invalid hex digit at byte %" PRId64, hi < 0 ? i : i + 1);
+		}
+		d[i / 2] = (char)(hi << 4 | lo);
+	}
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_base64_enc(ks_obj *so, bool url) {
+	const char *alpha = url ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	                        : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 4 * 3 - 3) ks_panic("string too long");
+	int64_t full = (s->len + 2) / 3 * 4;
+	int64_t outlen = url ? (s->len / 3 * 4 + (s->len % 3 == 0 ? 0 : s->len % 3 + 1)) : full;
+	char *d;
+	ks_obj *r = ks_str_alloc(outlen, &d);
+	const unsigned char *p = (const unsigned char *)s->data;
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i += 3) {
+		uint32_t v = (uint32_t)p[i] << 16;
+		int64_t rem = s->len - i;
+		if (rem > 1) v |= (uint32_t)p[i + 1] << 8;
+		if (rem > 2) v |= p[i + 2];
+		d[w++] = alpha[(v >> 18) & 63];
+		d[w++] = alpha[(v >> 12) & 63];
+		if (rem > 1) d[w++] = alpha[(v >> 6) & 63];
+		else if (!url) d[w++] = '=';
+		if (rem > 2) d[w++] = alpha[v & 63];
+		else if (!url) d[w++] = '=';
+	}
+	return r;
+}
+
+KS_RT ks_obj *ks_base64(ks_obj *s) { return ks_base64_enc(s, false); }
+KS_RT ks_obj *ks_base64url(ks_obj *s) { return ks_base64_enc(s, true); }
+
+KS_RT int ks_b64val(char c) {
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+' || c == '-') return 62;
+	if (c == '/' || c == '_') return 63;
+	return -1;
+}
+
+// ks_unbase64 accepts the standard and URL-safe alphabets, with or without
+// padding. Whitespace and any other byte are errors.
+KS_RT ks_obj *ks_unbase64(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	int64_t n = s->len;
+	while (n > 0 && s->data[n - 1] == '=' && s->len - n < 2) n--;
+	if (n % 4 == 1) return ks_res_errf("unbase64: invalid length");
+	if (s->len != n && s->len % 4 != 0) return ks_res_errf("unbase64: invalid padding");
+	char *d;
+	ks_obj *r = ks_str_alloc(n / 4 * 3 + (n % 4 == 0 ? 0 : n % 4 - 1), &d);
+	int64_t w = 0;
+	uint32_t acc = 0;
+	int bits = 0;
+	for (int64_t i = 0; i < n; i++) {
+		int v = ks_b64val(s->data[i]);
+		if (v < 0) {
+			ks_release(r);
+			return ks_res_errf("unbase64: invalid character at byte %" PRId64, i);
+		}
+		acc = acc << 6 | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			d[w++] = (char)(acc >> bits);
+			acc &= (1u << bits) - 1;
+		}
+	}
+	if (acc != 0) {
+		ks_release(r);
+		return ks_res_errf("unbase64: non-zero trailing bits");
+	}
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_url_encode(ks_obj *so) {
+	static const char digits[] = "0123456789ABCDEF";
+	ks_str *s = KS_S(so);
+	if (s->len > INT64_MAX / 3) ks_panic("string too long");
+	char *buf = ks_alloc((size_t)s->len * 3 + 1);
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+			buf[w++] = (char)c;
+		} else {
+			buf[w++] = '%';
+			buf[w++] = digits[c >> 4];
+			buf[w++] = digits[c & 15];
+		}
+	}
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return r;
+}
+
+// ks_url_decode decodes %XX escapes and turns + into a space, as in query
+// strings and form bodies.
+KS_RT ks_obj *ks_url_decode(ks_obj *so) {
+	ks_str *s = KS_S(so);
+	char *buf = ks_alloc((size_t)s->len + 1);
+	int64_t w = 0;
+	for (int64_t i = 0; i < s->len; i++) {
+		char c = s->data[i];
+		if (c == '+') {
+			buf[w++] = ' ';
+		} else if (c == '%') {
+			int hi = -1, lo = -1;
+			if (i + 2 < s->len) {
+				hi = ks_hexval(s->data[i + 1]);
+				lo = ks_hexval(s->data[i + 2]);
+			}
+			if (hi < 0 || lo < 0) {
+				free(buf);
+				return ks_res_errf("url_decode: invalid escape at byte %" PRId64, i);
+			}
+			buf[w++] = (char)(hi << 4 | lo);
+			i += 2;
+		} else {
+			buf[w++] = c;
+		}
+	}
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return ks_res_ok_obj(r);
+}
+
 typedef struct {
 	ks_obj h;
 	bool ok;
