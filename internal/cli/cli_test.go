@@ -202,3 +202,54 @@ func TestReleaseBuildCLI(t *testing.T) {
 		t.Errorf("run --release: %d %q %q", code, runOut, runErr)
 	}
 }
+
+func TestTestCommand(t *testing.T) {
+	requireCC(t)
+	dir := t.TempDir()
+	write := func(rel, src string) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("lib.ks", "pub fn double(n: int) -> int { return n * 2; }\n")
+	write("a_test.ks", `import "lib.ks";
+fn test_double() { assert(lib.double(4) == 8, "double"); }
+fn test_wrong() { assert(lib.double(4) == 9, "nine"); }
+fn test_result() -> ! {
+    let n = try try_parse_int("7");
+    assert(n == 7, "seven");
+    return ok();
+}
+fn helper() {}
+`)
+	write("sub/b_test.ks", "fn test_files() { assert(file_exists(\"b_test.ks\"), \"runs in its own directory\"); }\n")
+	write(".hidden/c_test.ks", "fn test_never() { assert(false, \"hidden directories are skipped\"); }\n")
+	write("notes.ks", "fn test_not_a_test_file() { assert(false, \"only *_test.ks\"); }\n")
+
+	code, out, errOut := runCLI("test", dir)
+	if code != 1 || !strings.Contains(out, "ok   test_double") || !strings.Contains(out, "FAIL test_wrong (exit status 101)") ||
+		!strings.Contains(out, "ok   test_result") || !strings.Contains(out, "ok   test_files") || !strings.Contains(out, "2 passed, 1 failed") ||
+		strings.Contains(out, "test_never") || strings.Contains(out, "test_not_a_test_file") ||
+		!strings.Contains(errOut, "assertion failed: nine") {
+		t.Errorf("code %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	code, out, _ = runCLI("test", "--run", "double", filepath.Join(dir, "a_test.ks"))
+	if code != 0 || !strings.Contains(out, "1 passed, 0 failed") {
+		t.Errorf("--run: code %d\n%s", code, out)
+	}
+	bad := writeSource(t, "bad_test.ks", "fn test_args(n: int) {}\n")
+	if code, _, errOut := runCLI("test", bad); code != 1 || !strings.Contains(errOut, "test function test_args must take no parameters and return nothing or !") {
+		t.Errorf("bad signature: code %d, stderr %q", code, errOut)
+	}
+	empty := writeSource(t, "empty_test.ks", "fn helper() {}\n")
+	if code, out, _ := runCLI("test", empty); code != 0 || !strings.Contains(out, "no test functions") {
+		t.Errorf("empty: code %d, out %q", code, out)
+	}
+	if code, _, errOut := runCLI("test", "--bogus"); code != 2 || !strings.Contains(errOut, "unknown flag --bogus") {
+		t.Errorf("bogus flag: code %d, stderr %q", code, errOut)
+	}
+}

@@ -33,6 +33,16 @@ var stdPattern = regexp.MustCompile(`^std:[a-z][a-z0-9_]*$`)
 const stdPrefix = "std:"
 
 func Load(entry string) (*Program, error) {
+	return load(entry, false)
+}
+
+// LoadTests loads entry for kestrel test: main is optional, and the entry
+// file's test_ functions are collected in Program.Tests.
+func LoadTests(entry string) (*Program, error) {
+	return load(entry, true)
+}
+
+func load(entry string, test bool) (*Program, error) {
 	abs, err := filepath.Abs(entry)
 	if err != nil {
 		return nil, err
@@ -60,7 +70,7 @@ func Load(entry string) (*Program, error) {
 	if len(l.errs) > 0 {
 		return nil, l.errs.sorted()
 	}
-	return Check(l.order, main)
+	return check(l.order, main, test)
 }
 
 func (l *loader) display(real string) string {

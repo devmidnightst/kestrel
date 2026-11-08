@@ -210,4 +210,7 @@ type Program struct {
 	Entry   *Module
 	Main    *Func
 	Info    *Info
+	// Tests holds the entry file's test_ functions when the program was
+	// loaded for kestrel test; Main may then be nil.
+	Tests []*Func
 }
