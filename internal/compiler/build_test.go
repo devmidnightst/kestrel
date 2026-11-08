@@ -37,6 +37,7 @@ func buildAndRunOpts(t *testing.T, entry string, opts BuildOptions, args ...stri
 	}
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(exe, args...)
+	cmd.Stdin = strings.NewReader("")
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.Env = append(os.Environ(), sanitizerEnv()...)
