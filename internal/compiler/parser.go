@@ -234,6 +234,14 @@ func (p *parser) parseSignature(start Pos, pub bool) *FuncDecl {
 func (p *parser) parseType() *TypeExpr {
 	p.enter()
 	defer p.leave()
+	if p.at(Bang) {
+		bang := p.next()
+		te := &TypeExpr{Pos: bang.Pos, Result: true}
+		if p.startsType() {
+			te.Elem = p.parseType()
+		}
+		return te
+	}
 	if p.at(LBracket) {
 		lb := p.next()
 		elem := p.parseType()
@@ -256,6 +264,22 @@ func (p *parser) parseType() *TypeExpr {
 		te.Module, te.Name = t.Text, n.Text
 	}
 	return te
+}
+
+// startsType reports whether the next tokens begin a type after "!". A bare
+// "!" is followed by something else: a function body, "=", ",", ";", ")"
+// or "]". A "{" only starts a map type when it reads "{ name :", which a
+// block never does.
+func (p *parser) startsType() bool {
+	switch p.tok().Kind {
+	case LBracket, Bang:
+		return true
+	case IdentTok:
+		return true
+	case LBrace:
+		return p.peekKind(1) == IdentTok && p.peekKind(2) == Colon
+	}
+	return false
 }
 
 func (p *parser) parseMapLit(pos Pos) *MapLit {
@@ -358,11 +382,11 @@ func (p *parser) parseStmt() Stmt {
 		}
 		p.expect(Semicolon, "after return")
 		return s
-	case KwPrint:
+	case KwPrint, KwEprint:
 		p.next()
-		p.expect(LParen, "after print")
-		s := &PrintStmt{Pos: t.Pos, Args: p.parseArgs()}
-		p.expect(Semicolon, "after print statement")
+		p.expect(LParen, "after "+t.Kind.String())
+		s := &PrintStmt{Pos: t.Pos, Args: p.parseArgs(), Stderr: t.Kind == KwEprint}
+		p.expect(Semicolon, "after "+t.Kind.String()+" statement")
 		return s
 	case KwBreak:
 		p.next()
@@ -386,11 +410,19 @@ func (p *parser) parseStmt() Stmt {
 		p.expect(Semicolon, "after assignment")
 		return s
 	}
-	if _, ok := x.(*CallExpr); !ok {
+	if !isCallStmt(x) {
 		p.fail(t.Pos, "expression result is unused; only function calls may be used as statements")
 	}
 	p.expect(Semicolon, "after expression statement")
 	return &ExprStmt{Pos: t.Pos, X: x}
+}
+
+func isCallStmt(x Expr) bool {
+	if tr, ok := x.(*TryExpr); ok {
+		x = tr.X
+	}
+	_, ok := x.(*CallExpr)
+	return ok
 }
 
 func (p *parser) sawRange() bool {
@@ -511,6 +543,10 @@ func (p *parser) parseUnary() Expr {
 	p.enter()
 	defer p.leave()
 	t := p.tok()
+	if t.Kind == KwTry {
+		p.next()
+		return &TryExpr{Pos: t.Pos, X: p.parseUnary()}
+	}
 	if t.Kind == Minus || t.Kind == Bang {
 		p.next()
 		if lit := p.tok(); t.Kind == Minus && lit.Kind == IntTok && lit.Text == minIntMagnitude {

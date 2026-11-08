@@ -30,6 +30,8 @@ type checker struct {
 	externs  map[string]*Func
 	structs  []*StructInfo
 	allowMut *CallExpr
+	allowTry *TryExpr
+	want     Type
 }
 
 func CheckSource(file string, src []byte) (*Program, error) {
@@ -91,8 +93,8 @@ func Check(modules []*Module, entry *Module) (*Program, error) {
 		c.errorf(main.Decl.NamePos, "main cannot be a c function")
 	case len(main.Params) != 0:
 		c.errorf(main.Decl.NamePos, "main must not take parameters (use args() to read command-line arguments)")
-	case main.Result != Void && main.Result != IntType:
-		c.errorf(main.Decl.Result.Pos, "main must return nothing or int, not %s", main.Result)
+	case main.Result != Void && main.Result != IntType && main.Result != ResultOf(Void) && main.Result != Invalid:
+		c.errorf(main.Decl.Result.Pos, "main must return nothing, int or !, not %s", main.Result)
 	}
 	prog.Main = main
 	if len(c.errs) > 0 {
@@ -108,6 +110,17 @@ func (c *checker) errorf(pos Pos, format string, args ...any) {
 func (c *checker) resolveType(m *Module, t *TypeExpr) Type {
 	if t == nil {
 		return Void
+	}
+	if t.Result {
+		if t.Elem == nil {
+			return ResultOf(Void)
+		}
+		inner := c.resolveType(m, t.Elem)
+		if inner != Invalid && inner.Kind == KResult {
+			c.errorf(t.Pos, "result types cannot be nested (%s)", t)
+			return Invalid
+		}
+		return ResultOf(inner)
 	}
 	if t.Key != nil {
 		key := c.resolveType(m, t.Key)
@@ -421,6 +434,9 @@ func (c *checker) mutatingRHS(e Expr) {
 	if call, ok := e.(*CallExpr); ok {
 		c.allowMut = call
 	}
+	if tr, ok := e.(*TryExpr); ok {
+		c.allowTry = tr
+	}
 }
 
 func (c *checker) assignable(pos Pos, got, want Type, what string) {
@@ -445,6 +461,7 @@ func (c *checker) checkStmt(s Stmt) {
 			t = c.exprWant(s.Value, nil)
 		}
 		c.allowMut = nil
+		c.allowTry = nil
 		v := c.newVar(s.Name, t, s.Mutable, s.NamePos)
 		c.info.Defs[s] = v
 		c.declare(v)
@@ -453,6 +470,7 @@ func (c *checker) checkStmt(s Stmt) {
 		c.mutatingRHS(s.Value)
 		got := c.exprWant(s.Value, want)
 		c.allowMut = nil
+		c.allowTry = nil
 		if got != Invalid && want != Invalid && got != want {
 			c.errorf(s.Value.P(), "cannot assign value of type %s to %s of type %s", got, describePlace(s.Target), want)
 		}
@@ -515,7 +533,10 @@ func (c *checker) checkStmt(s Stmt) {
 			c.errorf(s.Value.P(), "function %s does not return a value", c.fn.Name)
 			return
 		}
+		c.mutatingRHS(s.Value)
 		got := c.exprWant(s.Value, want)
+		c.allowMut = nil
+		c.allowTry = nil
 		if got != Invalid && want != Invalid && got != want {
 			c.errorf(s.Value.P(), "cannot return value of type %s from function %s (returns %s)", got, c.fn.Name, want)
 		}
@@ -527,6 +548,7 @@ func (c *checker) checkStmt(s Stmt) {
 		c.mutatingRHS(s.X)
 		c.expr(s.X)
 		c.allowMut = nil
+		c.allowTry = nil
 	case *BreakStmt:
 		if c.loops == 0 {
 			c.errorf(s.Pos, "break outside of a loop")
@@ -656,10 +678,17 @@ func (c *checker) exprWant(e Expr, want Type) Type {
 		t = c.mapLit(lit, want)
 		c.info.Types[e] = t
 	} else {
+		if _, ok := e.(*CallExpr); ok {
+			c.want = want
+		}
 		t = c.expr(e)
 	}
 	if t == Void {
-		c.errorf(e.P(), "function call does not produce a value")
+		if _, ok := e.(*TryExpr); ok {
+			c.errorf(e.P(), "try of a ! result does not produce a value (use it as a statement: try f();)")
+		} else {
+			c.errorf(e.P(), "function call does not produce a value")
+		}
 		return Invalid
 	}
 	return t
@@ -821,6 +850,8 @@ func (c *checker) exprType(e Expr) Type {
 		return c.binary(e)
 	case *CallExpr:
 		return c.call(e)
+	case *TryExpr:
+		return c.tryExpr(e)
 	}
 	panic(fmt.Sprintf("unexpected expression %T", e))
 }
@@ -923,7 +954,44 @@ func (c *checker) binary(e *BinaryExpr) Type {
 	return Invalid
 }
 
+func (c *checker) tryExpr(e *TryExpr) Type {
+	allowed := c.allowTry == e
+	c.allowTry = nil
+	var want Type
+	if c.fn.Result.Kind == KResult {
+		want = c.fn.Result
+	}
+	if _, ok := e.X.(*CallExpr); ok {
+		c.want = want
+	}
+	t := c.expr(e.X)
+	if !allowed {
+		c.errorf(e.Pos, "try must be the whole value of a let, var, assignment, return or call statement")
+	}
+	if c.fn.Result.Kind != KResult && c.fn.Result != Invalid {
+		res := "nothing"
+		if c.fn.Result != Void {
+			res = c.fn.Result.String()
+		}
+		c.errorf(e.Pos, "try needs a function that returns a result type (!T), but %s returns %s", c.fn.Name, res)
+	}
+	if t == Invalid {
+		return Invalid
+	}
+	if t.Kind != KResult {
+		if t == Void {
+			c.errorf(e.X.P(), "try expects a result (!T), but this call returns nothing")
+		} else {
+			c.errorf(e.X.P(), "try expects a result (!T), not %s", t)
+		}
+		return Invalid
+	}
+	return t.Elem
+}
+
 func (c *checker) call(e *CallExpr) Type {
+	want := c.want
+	c.want = nil
 	var fn *Func
 	var name string
 	switch callee := e.Fn.(type) {
@@ -934,6 +1002,9 @@ func (c *checker) call(e *CallExpr) Type {
 		} else if f := c.mod.Funcs[name]; f != nil {
 			fn = f
 		} else if builtinNames[name] {
+			if name == "ok" || name == "err" {
+				return c.resultCtor(e, name, want)
+			}
 			return c.builtin(e, name)
 		} else if c.mod.Imports[name] != nil {
 			c.errorf(callee.Pos, "module %s cannot be called", name)

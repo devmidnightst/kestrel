@@ -14,6 +14,7 @@ const (
 	KArray
 	KMap
 	KStruct
+	KResult
 )
 
 type TypeDesc struct {
@@ -39,7 +40,24 @@ var (
 	arrayTypes = map[Type]Type{}
 	mapMu      sync.Mutex
 	mapTypes   = map[[2]Type]Type{}
+	resultMu   sync.Mutex
+	results    = map[Type]Type{}
 )
+
+// ResultOf returns the result type !elem. elem is Void for a bare !.
+func ResultOf(elem Type) Type {
+	if elem == Invalid {
+		return Invalid
+	}
+	resultMu.Lock()
+	defer resultMu.Unlock()
+	if t, ok := results[elem]; ok {
+		return t
+	}
+	t := &TypeDesc{Kind: KResult, Elem: elem}
+	results[elem] = t
+	return t
+}
 
 func ArrayOf(elem Type) Type {
 	if elem == Invalid {
@@ -88,12 +106,17 @@ func (t *TypeDesc) String() string {
 		return "{" + t.Key.String() + ": " + t.Elem.String() + "}"
 	case KStruct:
 		return t.Struct.Name
+	case KResult:
+		if t.Elem == Void {
+			return "!"
+		}
+		return "!" + t.Elem.String()
 	}
 	return "invalid"
 }
 
 func (t *TypeDesc) Managed() bool {
-	return t.Kind == KString || t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct
+	return t.Kind == KString || t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct || t.Kind == KResult
 }
 
 func (t *TypeDesc) Comparable() bool {

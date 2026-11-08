@@ -10,6 +10,8 @@ type builtinSig struct {
 
 var stringArray = ArrayOf(StringType)
 
+var intArray = ArrayOf(IntType)
+
 var fixedBuiltins = map[string]builtinSig{
 	"float":       {[]Type{IntType}, FloatType, "(double)"},
 	"int":         {[]Type{FloatType}, IntType, "ks_float_to_int"},
@@ -48,6 +50,25 @@ var fixedBuiltins = map[string]builtinSig{
 	"tcp_close":   {[]Type{IntType}, Void, "ks_tcp_close"},
 	"exit":        {[]Type{IntType}, Void, "ks_exit"},
 	"assert":      {[]Type{BoolType, StringType}, Void, "ks_assert"},
+
+	"try_read_file":   {[]Type{StringType}, ResultOf(StringType), "ks_try_read_file"},
+	"try_write_file":  {[]Type{StringType, StringType}, ResultOf(Void), "ks_try_write_file"},
+	"try_parse_int":   {[]Type{StringType}, ResultOf(IntType), "ks_try_parse_int"},
+	"try_parse_float": {[]Type{StringType}, ResultOf(FloatType), "ks_try_parse_float"},
+
+	"getenv":             {[]Type{StringType}, StringType, "ks_getenv"},
+	"has_env":            {[]Type{StringType}, BoolType, "ks_has_env"},
+	"time_ms":            {nil, IntType, "ks_time_ms"},
+	"clock_ms":           {nil, IntType, "ks_clock_ms"},
+	"sleep_ms":           {[]Type{IntType}, Void, "ks_sleep_ms"},
+	"pid":                {nil, IntType, "ks_pid"},
+	"trap_shutdown":      {nil, Void, "ks_trap_shutdown"},
+	"shutdown_requested": {nil, BoolType, "ks_shutdown_requested"},
+
+	"tcp_listen_shared": {[]Type{StringType, IntType}, IntType, "ks_tcp_listen_shared"},
+	"tcp_poll":          {[]Type{intArray, IntType}, intArray, "ks_tcp_poll"},
+	"tcp_set_timeout":   {[]Type{IntType, IntType}, BoolType, "ks_tcp_set_timeout"},
+	"tcp_peer":          {[]Type{IntType}, StringType, "ks_tcp_peer"},
 }
 
 var builtinNames = map[string]bool{
@@ -55,6 +76,8 @@ var builtinNames = map[string]bool{
 	"push": true, "pop": true, "fill": true, "slice": true,
 	"has": true, "keys": true, "values": true, "delete": true,
 	"fmt": true,
+	"ok":  true, "err": true, "is_ok": true, "is_err": true,
+	"error": true, "unwrap": true, "unwrap_or": true,
 }
 
 func init() {
@@ -91,6 +114,46 @@ func (c *checker) builtin(e *CallExpr, name string) Type {
 	switch name {
 	case "fmt":
 		return c.builtinFmt(e)
+	case "is_ok", "is_err", "error", "unwrap":
+		if !argc(1) {
+			if name == "error" {
+				return StringType
+			}
+			if name == "unwrap" {
+				return Invalid
+			}
+			return BoolType
+		}
+		t := c.resultArg(e.Args[0], name)
+		switch name {
+		case "error":
+			return StringType
+		case "unwrap":
+			if t == nil {
+				return Invalid
+			}
+			return t.Elem
+		}
+		return BoolType
+	case "unwrap_or":
+		if !argc(2) {
+			return Invalid
+		}
+		t := c.resultArg(e.Args[0], name)
+		if t == nil {
+			c.valueExpr(e.Args[1])
+			return Invalid
+		}
+		if t.Elem == Void {
+			c.valueExpr(e.Args[1])
+			c.errorf(e.Args[0].P(), "unwrap_or needs a result with a value, not %s", t)
+			return Invalid
+		}
+		got := c.exprWant(e.Args[1], t.Elem)
+		if got != Invalid && got != t.Elem {
+			c.errorf(e.Args[1].P(), "the fallback of unwrap_or must be %s, not %s", t.Elem, got)
+		}
+		return t.Elem
 	case "len":
 		if !argc(1) {
 			return IntType
@@ -329,4 +392,77 @@ func formatHoles(s string) (int, string) {
 		}
 	}
 	return n, ""
+}
+
+// resultArg checks the result argument of is_ok, is_err, error, unwrap and
+// unwrap_or. It returns nil when the argument is not a result.
+func (c *checker) resultArg(a Expr, name string) Type {
+	t := c.valueExpr(a)
+	if t == Invalid {
+		return nil
+	}
+	if t.Kind != KResult {
+		c.errorf(a.P(), "%s expects a result (!T), not %s", name, t)
+		return nil
+	}
+	return t
+}
+
+// resultCtor checks ok(v), ok() and err(message). The result type comes from
+// the value for ok, and from the expected type (a return, annotation,
+// parameter or field) for err.
+func (c *checker) resultCtor(e *CallExpr, name string, want Type) Type {
+	c.info.Builtins[e] = name
+	var wantRes Type
+	if want != nil && want != Invalid && want.Kind == KResult {
+		wantRes = want
+	}
+	if name == "err" {
+		if len(e.Args) != 1 {
+			for _, a := range e.Args {
+				c.valueExpr(a)
+			}
+			c.errorf(e.Pos, "err expects 1 argument (the error message), got %d", len(e.Args))
+			if wantRes != nil {
+				return wantRes
+			}
+			return Invalid
+		}
+		got := c.exprWant(e.Args[0], StringType)
+		if got != Invalid && got != StringType {
+			c.errorf(e.Args[0].P(), "the message of err must be string, not %s", got)
+		}
+		if wantRes == nil {
+			c.errorf(e.Pos, "cannot infer the result type of err(...); use it where a result type is expected, such as a return in a function returning !T, or annotate it: let r: !int = err(...);")
+			return Invalid
+		}
+		return wantRes
+	}
+	switch len(e.Args) {
+	case 0:
+		return ResultOf(Void)
+	case 1:
+	default:
+		for _, a := range e.Args {
+			c.valueExpr(a)
+		}
+		c.errorf(e.Pos, "ok expects at most 1 argument, got %d", len(e.Args))
+		return Invalid
+	}
+	var elemWant Type
+	if wantRes != nil && wantRes.Elem != Void {
+		elemWant = wantRes.Elem
+	}
+	t := c.exprWant(e.Args[0], elemWant)
+	if t == Invalid {
+		if wantRes != nil {
+			return wantRes
+		}
+		return Invalid
+	}
+	if t.Kind == KResult {
+		c.errorf(e.Args[0].P(), "ok of a result would nest result types (%s); return it directly", t)
+		return Invalid
+	}
+	return ResultOf(t)
 }

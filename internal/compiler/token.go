@@ -29,6 +29,8 @@ const (
 	KwBreak
 	KwContinue
 	KwStruct
+	KwTry
+	KwEprint
 
 	Plus
 	Minus
@@ -82,6 +84,8 @@ var kindText = map[Kind]string{
 	KwBreak:    "break",
 	KwContinue: "continue",
 	KwStruct:   "struct",
+	KwTry:      "try",
+	KwEprint:   "eprint",
 	Plus:       "+",
 	Minus:      "-",
 	Star:       "*",
@@ -129,6 +133,8 @@ var keywords = map[string]Kind{
 	"break":    KwBreak,
 	"continue": KwContinue,
 	"struct":   KwStruct,
+	"try":      KwTry,
+	"eprint":   KwEprint,
 }
 
 func (k Kind) String() string {

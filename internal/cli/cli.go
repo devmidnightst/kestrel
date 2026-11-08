@@ -15,16 +15,24 @@ import (
 	"github.com/devmidnightst/kestrel/internal/compiler"
 )
 
-var Version = "0.2.0-dev"
+var Version = "0.3.0-dev"
 
 const maxReportedErrors = 50
 
 const usage = `usage:
-  kestrel build <file.ks> [-o output] [--emit-c file.c] [--cc compiler] [--sanitize]
-  kestrel run <file.ks> [--cc compiler] [--sanitize] [-- program args...]
+  kestrel build <file.ks> [-o output] [--emit-c file.c] [build flags]
+  kestrel run <file.ks> [build flags] [-- program args...]
   kestrel check <file.ks>
   kestrel version
   kestrel help
+
+build flags:
+  --cc compiler     c compiler to use (default: $CC, then cc, gcc, clang)
+  --release         hardened, stripped binary for deployment
+  --static          link statically (best with musl, e.g. alpine)
+  --sanitize        debug build with address and undefined behavior sanitizers
+  --cflags "..."    extra c compiler flags (repeatable)
+  --ldflags "..."   extra linker flags (repeatable)
 `
 
 type options struct {
@@ -33,7 +41,18 @@ type options struct {
 	emitC    string
 	cc       string
 	sanitize bool
+	release  bool
+	static   bool
+	cflags   []string
+	ldflags  []string
 	progArgs []string
+}
+
+func (o options) build(output, emitC string) compiler.BuildOptions {
+	return compiler.BuildOptions{
+		Output: output, EmitC: emitC, CC: o.cc, Sanitize: o.sanitize,
+		Release: o.release, Static: o.static, CFlags: o.cflags, LDFlags: o.ldflags,
+	}
 }
 
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -73,7 +92,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				opts.output += ".exe"
 			}
 		}
-		err := compiler.Build(opts.file, compiler.BuildOptions{Output: opts.output, EmitC: opts.emitC, CC: opts.cc, Sanitize: opts.sanitize})
+		err := compiler.Build(opts.file, opts.build(opts.output, opts.emitC))
 		if err != nil {
 			reportError(stderr, err)
 			return 1
@@ -94,7 +113,7 @@ func run(opts options, stdin io.Reader, stdout, stderr io.Writer) int {
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	if err := compiler.Build(opts.file, compiler.BuildOptions{Output: exe, CC: opts.cc, Sanitize: opts.sanitize}); err != nil {
+	if err := compiler.Build(opts.file, opts.build(exe, "")); err != nil {
 		reportError(stderr, err)
 		return 1
 	}
@@ -155,6 +174,19 @@ func parseOptions(cmd string, args []string) (options, error) {
 			o.cc, err = value()
 		case a == "--sanitize" && cmd != "check":
 			o.sanitize = true
+		case a == "--release" && cmd != "check":
+			o.release = true
+		case a == "--static" && cmd != "check":
+			o.static = true
+		case (a == "--cflags" || a == "--ldflags") && cmd != "check":
+			var v string
+			if v, err = value(); err == nil {
+				if a == "--cflags" {
+					o.cflags = append(o.cflags, strings.Fields(v)...)
+				} else {
+					o.ldflags = append(o.ldflags, strings.Fields(v)...)
+				}
+			}
 		case strings.HasPrefix(a, "-") && a != "-":
 			return o, fmt.Errorf("unknown flag %s", a)
 		default:
@@ -169,6 +201,9 @@ func parseOptions(cmd string, args []string) (options, error) {
 	}
 	if o.file == "" {
 		return o, errors.New("missing source file")
+	}
+	if o.sanitize && (o.release || o.static) {
+		return o, errors.New("--sanitize cannot be combined with --release or --static")
 	}
 	return o, nil
 }

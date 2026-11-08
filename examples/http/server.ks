@@ -1,6 +1,6 @@
-// One HTTP request, then exit. This is the shape a Kestrel server can have
-// today: listen, accept, read, write, close. There is no second client until
-// the language grows concurrency.
+// One HTTP request, then exit: listen, accept, read, write, close. This is
+// the smallest possible server. service.ks next to it serves many clients at
+// once with tcp_poll and shuts down cleanly on SIGTERM.
 fn reply(body: string) -> string {
     return "HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body;
 }

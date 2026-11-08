@@ -24,6 +24,14 @@ example `CC=clang go test ./...`.
   semantics; a long-running allocation-heavy program under a 64 MiB address
   space limit (Linux) to show memory is reclaimed.
 - `randprog_test.go`: randomly generated well-typed programs (see below).
+- `results_test.go`: result types and `try`, including early returns from
+  loops with live arrays and maps, run under sanitizers to show nothing leaks.
+- `service_test.go`: `eprint`, environment and clock builtins, `tcp_poll`,
+  socket timeouts and `SO_REUSEPORT`, and `examples/http/service.ks` serving
+  concurrent clients while one connection holds a half-sent request, then
+  shutting down on SIGTERM (release and sanitized builds).
+- `release_test.go`: `--release` and `--static` flags, hardening checks with
+  `readelf`, and byte-for-byte reproducible builds.
 - `fuzz_test.go`: fuzz targets.
 - `internal/cli`: the command-line interface.
 
@@ -68,10 +76,20 @@ go test -run '^$' -fuzz '^FuzzCheckAndGenerate$' -fuzztime 60s ./internal/compil
 The fuzz targets assert that the lexer, parser, checker and C generator never
 panic on arbitrary input.
 
+## Docker
+
+```sh
+docker build -t kestrel .
+docker build -t hello-service -f examples/deploy/Dockerfile examples/http
+```
+
+CI builds both images and smoke tests the service, including a `docker stop`
+that must exit 0.
+
 ## Release builds
 
 ```sh
-go build -trimpath -ldflags "-s -w -X github.com/devmidnightst/kestrel/internal/cli.Version=0.2.0" -o kestrel ./cmd/kestrel
+go build -trimpath -ldflags "-s -w -X github.com/devmidnightst/kestrel/internal/cli.Version=0.3.0" -o kestrel ./cmd/kestrel
 ```
 
 Without the `-X` flag, `kestrel version` reports the development version.

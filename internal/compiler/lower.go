@@ -129,15 +129,19 @@ func (f *fnGen) stmt(s Stmt) {
 		}
 		f.close()
 	case *PrintStmt:
+		out := "stdout"
+		if s.Stderr {
+			out = "stderr"
+		}
 		f.open()
 		for i, a := range s.Args {
 			x := f.eval(a)
 			if i > 0 {
-				f.line("putchar(' ');")
+				f.line("fputc(' ', %s);", out)
 			}
-			f.line("%s", f.g.printValue(info.Types[a], x, false))
+			f.line("%s", f.g.printValue(info.Types[a], x, out, false))
 		}
-		f.line("putchar('\\n');")
+		f.line("fputc('\\n', %s);", out)
 		f.close()
 	case *IfStmt:
 		f.line("{")
@@ -462,6 +466,8 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 			args[i] = vals[fd.Name]
 		}
 		return f.temp("ks_obj *", fmt.Sprintf("%s_new(%s)", si.CName, strings.Join(args, ", "))), true
+	case *TryExpr:
+		return f.tryExpr(e, t)
 	case *CallExpr:
 		if name, ok := info.Builtins[e]; ok {
 			return f.builtin(e, name, t)
@@ -486,6 +492,32 @@ func (f *fnGen) evalRaw(e Expr) (string, bool) {
 		return f.temp(cType(fn.Result), call), fn.Result.Managed()
 	}
 	panic(fmt.Sprintf("unexpected expression %T", e))
+}
+
+// tryExpr evaluates the result, and on an error returns that same result
+// object from the function: an error carries no payload, so it is a valid
+// value of every result type. Before returning it releases every pending
+// temporary and every live variable, exactly like a return statement. The
+// checker only allows try as the whole value of a statement, so no owned
+// value is in flight outside the frames at this point.
+func (f *fnGen) tryExpr(e *TryExpr, t Type) (string, bool) {
+	r := f.eval(e.X)
+	f.line("if (!((ks_res *)%s)->ok) {", r)
+	f.ind++
+	e2 := f.temp("ks_obj *", fmt.Sprintf("ks_retain(%s)", r))
+	for i := len(f.frames) - 1; i >= 0; i-- {
+		for j := len(f.frames[i]) - 1; j >= 0; j-- {
+			f.line("ks_release(%s);", f.frames[i][j])
+		}
+	}
+	f.releaseAll(0)
+	f.line("return %s;", e2)
+	f.ind--
+	f.line("}")
+	if t == Void {
+		return "", false
+	}
+	return f.temp(cType(t), fmt.Sprintf("((ks_res *)%s)->%s", r, resField(t))), false
 }
 
 func (f *fnGen) binary(e *BinaryExpr, t Type) (string, bool) {
@@ -667,6 +699,36 @@ func (f *fnGen) builtin(e *CallExpr, name string, t Type) (string, bool) {
 	switch name {
 	case "fmt":
 		return f.fmtCall(e)
+	case "ok":
+		if len(e.Args) == 0 {
+			return f.temp("ks_obj *", "ks_res_ok_void()"), true
+		}
+		v := f.evalOwnedTemp(e.Args[0])
+		return f.temp("ks_obj *", fmt.Sprintf("ks_res_ok_%s(%s)", arrKind(t.Elem), v)), true
+	case "err":
+		msg := f.eval(e.Args[0])
+		return f.temp("ks_obj *", fmt.Sprintf("ks_res_err(%s)", msg)), true
+	case "is_ok", "is_err":
+		r := f.eval(e.Args[0])
+		neg := ""
+		if name == "is_err" {
+			neg = "!"
+		}
+		return f.temp("bool", fmt.Sprintf("%s((ks_res *)%s)->ok", neg, r)), false
+	case "error":
+		r := f.eval(e.Args[0])
+		return f.temp("ks_obj *", fmt.Sprintf("ks_res_error(%s)", r)), true
+	case "unwrap":
+		r := f.eval(e.Args[0])
+		f.line("ks_res_check(%s);", r)
+		if t == Void {
+			return "", false
+		}
+		return f.temp(cType(t), fmt.Sprintf("((ks_res *)%s)->%s", r, resField(t))), false
+	case "unwrap_or":
+		r := f.eval(e.Args[0])
+		d := f.eval(e.Args[1])
+		return f.temp(cType(t), fmt.Sprintf("((ks_res *)%s)->ok ? ((ks_res *)%s)->%s : %s", r, r, resField(t), d)), false
 	case "delete":
 		root, steps := f.prepPlace(e.Args[0])
 		key := f.eval(e.Args[1])

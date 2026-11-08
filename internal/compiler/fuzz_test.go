@@ -12,7 +12,11 @@ func addFuzzSeeds(f *testing.F) {
 	f.Add("import c \"stdlib.h\" { fn llabs(n: int) -> int; }\nfn main() { print(llabs(-1), \"s\\n\", true && !false); }")
 	f.Add("fn main() { let s = \"a\" + str(len(\"bc\")); { let s = 1; } break; }")
 	f.Add("fn main() { ((((((1)))))); }")
+	f.Add("fn g(s: string) -> !int { let n = try try_parse_int(s); return ok(n); }\nfn main() -> ! { let r: !int = err(\"x\"); print(g(\"1\"), unwrap_or(r, 2), is_ok(r)); try g(\"2\"); eprint(error(r)); return ok(); }")
+	f.Add("fn f() -> ! { return ok(); }\nstruct s { a: ![!int], b: !{string: int} }\nfn main() { let x = tcp_poll([1], 0); }")
 	paths, _ := filepath.Glob(filepath.Join("..", "..", "examples", "*.ks"))
+	more, _ := filepath.Glob(filepath.Join("..", "..", "examples", "http", "*.ks"))
+	paths = append(paths, more...)
 	for _, p := range paths {
 		if data, err := os.ReadFile(p); err == nil {
 			f.Add(string(data))
