@@ -873,8 +873,15 @@ KS_RT int64_t ks_tcp_send(int64_t fd, ks_obj *data) {
 #ifdef MSG_NOSIGNAL
 	flags |= MSG_NOSIGNAL;
 #endif
+	// MSG_DONTWAIT alone is not enough: darwin's send still blocks on a
+	// blocking socket. Make the socket non-blocking for this call only.
+	int fl = fcntl((int)fd, F_GETFL);
+	bool toggled = fl >= 0 && !(fl & O_NONBLOCK);
+	if (toggled) fcntl((int)fd, F_SETFL, fl | O_NONBLOCK);
 	ssize_t n = send((int)fd, s->data, (size_t)s->len, flags);
-	if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+	int e = errno;
+	if (toggled) fcntl((int)fd, F_SETFL, fl);
+	if (n < 0) return (e == EAGAIN || e == EWOULDBLOCK || e == EINTR) ? 0 : -1;
 	return (int64_t)n;
 }
 
