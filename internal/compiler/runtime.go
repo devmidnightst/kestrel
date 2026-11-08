@@ -24,6 +24,7 @@ const runtimeHead = `#define _POSIX_C_SOURCE 200809L
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__unix__) || defined(__APPLE__)
@@ -59,6 +60,7 @@ static uintptr_t ks_stack_limit;
 static ks_obj *ks_pending;
 static bool ks_draining;
 static volatile sig_atomic_t ks_shutdown_flag;
+static bool ks_shutdown_trapped;
 static const char *ks_loc;
 
 __attribute__((noreturn, unused)) static void ks_panic(const char *msg) {
@@ -1094,6 +1096,11 @@ KS_RT void ks_sleep_ms(int64_t ms) {
 	while (nanosleep(&ts, &rem) != 0 && errno == EINTR && !ks_shutdown_flag) ts = rem;
 }
 
+KS_RT int64_t ks_cpu_count(void) {
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	return n > 0 ? (int64_t)n : 1;
+}
+
 KS_RT int64_t ks_pid(void) {
 	return (int64_t)getpid();
 }
@@ -1104,6 +1111,7 @@ static void ks_on_shutdown(int sig) {
 }
 
 KS_RT void ks_trap_shutdown(void) {
+	ks_shutdown_trapped = true;
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = ks_on_shutdown;
@@ -1115,6 +1123,107 @@ KS_RT void ks_trap_shutdown(void) {
 
 KS_RT bool ks_shutdown_requested(void) {
 	return ks_shutdown_flag != 0;
+}
+
+static volatile sig_atomic_t ks_sup_stop;
+
+static void ks_sup_on_signal(int sig) {
+	(void)sig;
+	ks_sup_stop = 1;
+}
+
+KS_RT void ks_sup_signals(void (*handler)(int)) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+// ks_fork_workers runs n worker processes and supervises them. Each worker
+// returns from fork_workers with its index; the supervisor never returns.
+// A worker that crashes or exits non-zero is replaced (after a pause if it
+// died within a second of starting). SIGTERM or SIGINT to the supervisor
+// is forwarded to every worker; workers get 30 seconds to exit before
+// SIGKILL, then the supervisor exits 0.
+KS_RT int64_t ks_fork_workers(int64_t n) {
+	if (n < 1 || n > 1024) ks_panicf("fork_workers: worker count %" PRId64 " must be 1 to 1024", n);
+	fflush(stdout);
+	fflush(stderr);
+	pid_t *pids = ks_alloc((size_t)n * sizeof(pid_t));
+	int64_t *started = ks_alloc((size_t)n * sizeof(int64_t));
+	ks_sup_signals(ks_sup_on_signal);
+	int64_t live = 0;
+	for (int64_t i = 0; i <= n; i++) {
+		if (i == n) break;
+		pid_t p = fork();
+		if (p < 0) ks_panicf("fork_workers: fork failed: %s", strerror(errno));
+		if (p == 0) {
+			free(pids);
+			free(started);
+			if (ks_shutdown_trapped) ks_trap_shutdown();
+			else ks_sup_signals(SIG_DFL);
+			return i;
+		}
+		pids[i] = p;
+		started[i] = ks_clock_ms();
+		live++;
+	}
+	int64_t stop_at = -1;
+	while (live > 0) {
+		if (ks_sup_stop && stop_at < 0) {
+			stop_at = ks_clock_ms();
+			for (int64_t i = 0; i < n; i++) if (pids[i] > 0) kill(pids[i], SIGTERM);
+		}
+		if (stop_at >= 0 && ks_clock_ms() - stop_at > 30000) {
+			for (int64_t i = 0; i < n; i++) if (pids[i] > 0) kill(pids[i], SIGKILL);
+		}
+		int status = 0;
+		pid_t p = waitpid(-1, &status, WNOHANG);
+		if (p < 0 && errno == ECHILD) break;
+		if (p <= 0) {
+			struct timespec ts = {0, 50 * 1000000L};
+			nanosleep(&ts, NULL);
+			continue;
+		}
+		int64_t i = 0;
+		while (i < n && pids[i] != p) i++;
+		if (i == n) continue;
+		pids[i] = 0;
+		live--;
+		bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+		if (stop_at >= 0 || clean) continue;
+		if (WIFSIGNALED(status)) {
+			fprintf(stderr, "kestrel: worker %" PRId64 " (pid %d) killed by signal %d; restarting\n", i, (int)p, WTERMSIG(status));
+		} else {
+			fprintf(stderr, "kestrel: worker %" PRId64 " (pid %d) exited with status %d; restarting\n", i, (int)p, WEXITSTATUS(status));
+		}
+		fflush(stderr);
+		if (ks_clock_ms() - started[i] < 1000) {
+			struct timespec ts = {1, 0};
+			nanosleep(&ts, NULL);
+			if (ks_sup_stop) continue;
+		}
+		pid_t c = fork();
+		if (c < 0) {
+			fprintf(stderr, "kestrel: fork_workers: fork failed: %s\n", strerror(errno));
+			continue;
+		}
+		if (c == 0) {
+			free(pids);
+			free(started);
+			if (ks_shutdown_trapped) ks_trap_shutdown();
+			else ks_sup_signals(SIG_DFL);
+			return i;
+		}
+		pids[i] = c;
+		started[i] = ks_clock_ms();
+		live++;
+	}
+	fflush(stdout);
+	fflush(stderr);
+	_Exit(0);
 }
 
 typedef struct {

@@ -64,6 +64,8 @@ var fixedBuiltins = map[string]builtinSig{
 	"pid":                {nil, IntType, "ks_pid"},
 	"trap_shutdown":      {nil, Void, "ks_trap_shutdown"},
 	"shutdown_requested": {nil, BoolType, "ks_shutdown_requested"},
+	"fork_workers":       {[]Type{IntType}, IntType, "ks_fork_workers"},
+	"cpu_count":          {nil, IntType, "ks_cpu_count"},
 
 	"tcp_listen_shared":   {[]Type{StringType, IntType}, IntType, "ks_tcp_listen_shared"},
 	"tcp_poll":            {[]Type{intArray, IntType}, intArray, "ks_tcp_poll"},

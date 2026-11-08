@@ -85,3 +85,35 @@ func TestNonBlockingSockets(t *testing.T) {
 		}
 	}
 }
+
+func TestForkWorkersRestartsCrashes(t *testing.T) {
+	requireCC(t)
+	// Worker 1 crashes on its first run (no marker file yet), then is
+	// restarted, finds the marker and exits cleanly. Worker 0 exits at once.
+	src := `fn main() {
+    let w = fork_workers(2);
+    if w == 1 {
+        if !file_exists("crashed.txt") {
+            write_file("crashed.txt", "x");
+            let empty: [int] = [];
+            print(empty[0]);
+        }
+        print("worker 1 recovered");
+        return;
+    }
+    print("worker 0 done");
+}`
+	r := runWith(t, src, "", false)
+	if r.code != 0 || !strings.Contains(r.stdout, "worker 0 done\n") || !strings.Contains(r.stdout, "worker 1 recovered\n") ||
+		!strings.Contains(r.stderr, "index out of range") || !strings.Contains(r.stderr, "kestrel: worker 1 (pid ") ||
+		!strings.Contains(r.stderr, "exited with status 101; restarting") {
+		t.Errorf("exit %d\nstdout %q\nstderr %q", r.code, r.stdout, r.stderr)
+	}
+	if cpu := runWith(t, "fn main() { print(cpu_count() >= 1); }", "", false); cpu.stdout != "true\n" {
+		t.Errorf("cpu_count: %q", cpu.stdout)
+	}
+	bad := runWith(t, "fn main() { let w = fork_workers(0); }", "", false)
+	if bad.code != 101 || !strings.Contains(bad.stderr, "worker count 0 must be 1 to 1024") {
+		t.Errorf("fork_workers(0): %d %q", bad.code, bad.stderr)
+	}
+}
