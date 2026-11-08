@@ -280,8 +280,8 @@ func (f *fnGen) forMap(s *ForStmt, outer *genScope, lab string) {
 	idx := f.temp("int64_t", "0")
 	f.line("while (1) {")
 	f.ind++
-	f.line("while (%s < %s->cap && %s->used[%s] != 1) %s++;", idx, m, m, idx, idx)
-	f.line("if (!(%s < %s->cap)) break;", idx, m)
+	f.line("while (%s < %s->n && !%s->alive[%s]) %s++;", idx, m, m, idx, idx)
+	f.line("if (!(%s < %s->n)) break;", idx, m)
 	f.blockGo(s.Body, true, lab, func(sc *genScope) {
 		v := info.Loops[s]
 		get := fmt.Sprintf("%s->keys[%s]", m, idx)

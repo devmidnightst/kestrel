@@ -1413,8 +1413,30 @@ var mapInsts = []mapInst{
 }
 
 const mapHelpers = `
+static uint64_t ks_seed0, ks_seed1;
+
+// ks_init_seed picks the per-process hash key, so nobody outside the
+// process can choose map keys that collide.
+KS_RT void ks_init_seed(void) {
+	uint64_t k[2] = {0, 0};
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	bool ok = false;
+	if (fd >= 0) {
+		ok = read(fd, k, sizeof k) == (ssize_t)sizeof k;
+		close(fd);
+	}
+	if (!ok) {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		k[0] = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 20) ^ (uint64_t)(uintptr_t)&ts;
+		k[1] = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)ks_init_seed;
+	}
+	ks_seed0 = k[0];
+	ks_seed1 = k[1];
+}
+
 KS_RT uint64_t ks_hash_i64(int64_t k) {
-	uint64_t x = (uint64_t)k;
+	uint64_t x = (uint64_t)k ^ ks_seed0;
 	x ^= x >> 30;
 	x *= 0xbf58476d1ce4e5b9ULL;
 	x ^= x >> 27;
@@ -1423,14 +1445,47 @@ KS_RT uint64_t ks_hash_i64(int64_t k) {
 	return x;
 }
 
+#define KS_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define KS_SIPROUND \
+	do { \
+		v0 += v1; v1 = KS_ROTL(v1, 13); v1 ^= v0; v0 = KS_ROTL(v0, 32); \
+		v2 += v3; v3 = KS_ROTL(v3, 16); v3 ^= v2; \
+		v0 += v3; v3 = KS_ROTL(v3, 21); v3 ^= v0; \
+		v2 += v1; v1 = KS_ROTL(v1, 17); v1 ^= v2; v2 = KS_ROTL(v2, 32); \
+	} while (0)
+
+// SipHash-1-3 keyed with the per-process seed.
 KS_RT uint64_t ks_hash_str(ks_obj *o) {
 	ks_str *s = KS_S(o);
-	uint64_t h = 14695981039346656037ULL;
-	for (int64_t i = 0; i < s->len; i++) {
-		h ^= (unsigned char)s->data[i];
-		h *= 1099511628211ULL;
+	const unsigned char *in = (const unsigned char *)s->data;
+	size_t len = (size_t)s->len;
+	uint64_t v0 = 0x736f6d6570736575ULL ^ ks_seed0;
+	uint64_t v1 = 0x646f72616e646f6dULL ^ ks_seed1;
+	uint64_t v2 = 0x6c7967656e657261ULL ^ ks_seed0;
+	uint64_t v3 = 0x7465646279746573ULL ^ ks_seed1;
+	size_t whole = len - (len % 8);
+	for (size_t i = 0; i < whole; i += 8) {
+		uint64_t m;
+		memcpy(&m, in + i, 8);
+		v3 ^= m;
+		KS_SIPROUND;
+		v0 ^= m;
 	}
-	return h;
+	uint64_t b = ((uint64_t)len) << 56;
+	for (size_t i = 0; i < len % 8; i++) b |= ((uint64_t)in[whole + i]) << (8 * i);
+	v3 ^= b;
+	KS_SIPROUND;
+	v0 ^= b;
+	v2 ^= 0xff;
+	KS_SIPROUND;
+	KS_SIPROUND;
+	KS_SIPROUND;
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+
+KS_RT size_t ks_array_bytes(int64_t count, size_t size) {
+	if (count < 0 || (uint64_t)count > SIZE_MAX / size) ks_panic("map too large");
+	return (size_t)count * size;
 }
 `
 
@@ -1451,66 +1506,85 @@ func emitMap(m mapInst) string {
 }
 
 const mapTemplate = `
+// Maps keep insertion order: entries live in arrays in the order they were
+// added, and a power-of-two index table maps hashes to entry numbers.
+// Deleting marks an entry dead; its index slot keeps pointing at it as a
+// tombstone until the next rebuild compacts the entries.
 typedef struct {
 	ks_obj h;
 	int64_t len;
-	int64_t cap;
-	uint8_t *used;
+	int64_t n;
+	int64_t ecap;
+	uint8_t *alive;
 	KEYC *keys;
 	VALC *vals;
+	int64_t icap;
+	int64_t *index;
 } NAME;
 
 KS_RT void NAME_drop(ks_obj *o);
 KS_RT ks_obj *NAME_clone(ks_obj *o);
 
 KS_RT ks_obj *NAME_new(int64_t cap) {
-	if (cap < 8) cap = 8;
-	int64_t p2 = 8;
-	while (p2 < cap) {
-		if (p2 > INT64_MAX / 2) ks_panic("map too large");
-		p2 *= 2;
+	if (cap < 4) cap = 4;
+	int64_t icap = 8;
+	while (icap < cap * 2) {
+		if (icap > INT64_MAX / 4) ks_panic("map too large");
+		icap *= 2;
 	}
 	NAME *m = ks_alloc(sizeof *m);
 	ks_init_obj(&m->h, NAME_drop, NAME_clone);
 	m->len = 0;
-	m->cap = p2;
-	m->used = ks_alloc((size_t)p2);
-	memset(m->used, 0, (size_t)p2);
-	m->keys = ks_alloc((size_t)p2 * sizeof(KEYC));
-	m->vals = ks_alloc((size_t)p2 * sizeof(VALC));
+	m->n = 0;
+	m->ecap = cap;
+	m->alive = ks_alloc(ks_array_bytes(cap, 1));
+	m->keys = ks_alloc(ks_array_bytes(cap, sizeof(KEYC)));
+	m->vals = ks_alloc(ks_array_bytes(cap, sizeof(VALC)));
+	m->icap = icap;
+	m->index = ks_alloc(ks_array_bytes(icap, sizeof(int64_t)));
+	memset(m->index, 0, (size_t)icap * sizeof(int64_t));
 	return &m->h;
 }
 
 KS_RT void NAME_drop(ks_obj *o) {
 	NAME *m = (NAME *)o;
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		KEYC key = m->keys[i];
 		KEYRELEASE;
 		VALC v = m->vals[i];
 		VALRELEASE;
 	}
-	free(m->used);
+	free(m->alive);
 	free(m->keys);
 	free(m->vals);
+	free(m->index);
 	free(o);
+}
+
+KS_RT void NAME_place(NAME *m, int64_t e) {
+	KEYC key = m->keys[e];
+	int64_t mask = m->icap - 1;
+	int64_t i = (int64_t)(KEYHASH & (uint64_t)mask);
+	while (m->index[i] != 0) i = (i + 1) & mask;
+	m->index[i] = e + 1;
 }
 
 KS_RT ks_obj *NAME_clone(ks_obj *o) {
 	NAME *m = (NAME *)o;
-	ks_obj *r = NAME_new(m->cap);
+	ks_obj *r = NAME_new(m->len);
 	NAME *c = (NAME *)r;
-	c->len = m->len;
-	memcpy(c->used, m->used, (size_t)m->cap);
-	memcpy(c->keys, m->keys, (size_t)m->cap * sizeof(KEYC));
-	memcpy(c->vals, m->vals, (size_t)m->cap * sizeof(VALC));
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
-		KEYC key = c->keys[i];
-		c->keys[i] = KEYRETAIN;
-		VALC v = c->vals[i];
-		c->vals[i] = VALRETAIN;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
+		KEYC key = m->keys[i];
+		VALC v = m->vals[i];
+		int64_t e = c->n++;
+		c->keys[e] = KEYRETAIN;
+		c->vals[e] = VALRETAIN;
+		c->alive[e] = 1;
+		NAME_place(c, e);
 	}
+	c->len = c->n;
 	return r;
 }
 
@@ -1518,124 +1592,115 @@ KS_RT int64_t NAME_len(ks_obj *o) {
 	return ((NAME *)o)->len;
 }
 
-KS_RT int64_t NAME_find(NAME *m, KEYC key, bool *found) {
-	uint64_t h = KEYHASH;
-	int64_t mask = m->cap - 1;
-	int64_t i = (int64_t)(h & (uint64_t)mask);
-	int64_t tomb = -1;
-	for (int64_t n = 0; n < m->cap; n++) {
-		uint8_t u = m->used[i];
-		if (u == 0) { *found = false; return tomb >= 0 ? tomb : i; }
-		if (u == 2) {
-			if (tomb < 0) tomb = i;
-		} else {
-			KEYC a = m->keys[i];
+KS_RT int64_t NAME_find(NAME *m, KEYC key) {
+	int64_t mask = m->icap - 1;
+	int64_t i = (int64_t)(KEYHASH & (uint64_t)mask);
+	for (;;) {
+		int64_t e = m->index[i];
+		if (e == 0) return -1;
+		e--;
+		if (m->alive[e]) {
+			KEYC a = m->keys[e];
 			KEYC b = key;
-			if (KEYEQ) { *found = true; return i; }
+			if (KEYEQ) return e;
 		}
 		i = (i + 1) & mask;
 	}
-	*found = false;
-	if (tomb >= 0) return tomb;
-	ks_panic("map too large");
-	return 0;
 }
 
-KS_RT void NAME_grow(NAME *m) {
-	int64_t ncap = m->cap == 0 ? 8 : m->cap * 2;
-	if (m->cap > 0 && m->cap > INT64_MAX / 2) ks_panic("map too large");
-	uint8_t *used = ks_alloc((size_t)ncap);
-	memset(used, 0, (size_t)ncap);
-	KEYC *keys = ks_alloc((size_t)ncap * sizeof(KEYC));
-	VALC *vals = ks_alloc((size_t)ncap * sizeof(VALC));
-	uint8_t *oldu = m->used;
-	KEYC *oldk = m->keys;
-	VALC *oldv = m->vals;
-	int64_t ocap = m->cap;
-	m->used = used;
-	m->keys = keys;
-	m->vals = vals;
-	m->cap = ncap;
-	m->len = 0;
-	for (int64_t i = 0; i < ocap; i++) {
-		if (oldu[i] != 1) continue;
-		bool found = false;
-		int64_t slot = NAME_find(m, oldk[i], &found);
-		m->used[slot] = 1;
-		m->keys[slot] = oldk[i];
-		m->vals[slot] = oldv[i];
-		m->len++;
+// NAME_rebuild drops dead entries and rehashes into icap index slots.
+KS_RT void NAME_rebuild(NAME *m, int64_t icap) {
+	int64_t j = 0;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
+		m->keys[j] = m->keys[i];
+		m->vals[j] = m->vals[i];
+		m->alive[j] = 1;
+		j++;
 	}
-	free(oldu);
-	free(oldk);
-	free(oldv);
+	m->n = j;
+	free(m->index);
+	m->icap = icap;
+	m->index = ks_alloc(ks_array_bytes(icap, sizeof(int64_t)));
+	memset(m->index, 0, (size_t)icap * sizeof(int64_t));
+	for (int64_t e = 0; e < m->n; e++) NAME_place(m, e);
 }
 
 KS_RT void NAME_set(ks_obj *o, KEYC key, VALC val) {
 	NAME *m = (NAME *)o;
-	if (m->cap == 0 || (m->len + 1) * 4 > m->cap * 3) NAME_grow(m);
-	bool found = false;
-	int64_t i = NAME_find(m, key, &found);
-	if (found) {
-		VALC v = m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e >= 0) {
+		VALC v = m->vals[e];
 		VALRELEASE;
-		m->vals[i] = val;
+		m->vals[e] = val;
 		return;
 	}
-	m->used[i] = 1;
-	m->keys[i] = KEYRETAIN;
-	m->vals[i] = val;
+	if ((m->n + 1) * 4 > m->icap * 3) {
+		int64_t icap = m->icap;
+		while ((m->len + 1) * 2 > icap) {
+			if (icap > INT64_MAX / 4) ks_panic("map too large");
+			icap *= 2;
+		}
+		NAME_rebuild(m, icap);
+	}
+	if (m->n == m->ecap) {
+		if (m->ecap > INT64_MAX / 2) ks_panic("map too large");
+		int64_t ncap = m->ecap * 2;
+		m->alive = ks_realloc(m->alive, ks_array_bytes(ncap, 1));
+		m->keys = ks_realloc(m->keys, ks_array_bytes(ncap, sizeof(KEYC)));
+		m->vals = ks_realloc(m->vals, ks_array_bytes(ncap, sizeof(VALC)));
+		m->ecap = ncap;
+	}
+	e = m->n++;
+	m->keys[e] = KEYRETAIN;
+	m->vals[e] = val;
+	m->alive[e] = 1;
 	m->len++;
+	NAME_place(m, e);
 }
 
 KS_RT bool NAME_delete(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	if (m->cap == 0) return false;
-	bool found = false;
-	int64_t i = NAME_find(m, key, &found);
-	if (!found) return false;
+	int64_t e = NAME_find(m, key);
+	if (e < 0) return false;
 	{
-		KEYC key = m->keys[i];
+		KEYC key = m->keys[e];
 		KEYRELEASE;
-		VALC v = m->vals[i];
+		VALC v = m->vals[e];
 		VALRELEASE;
 	}
-	m->used[i] = 2;
+	m->alive[e] = 0;
 	m->len--;
+	if (m->len == 0) {
+		m->n = 0;
+		memset(m->index, 0, (size_t)m->icap * sizeof(int64_t));
+	}
 	return true;
 }
 
 KS_RT bool NAME_has(ks_obj *o, KEYC key) {
-	NAME *m = (NAME *)o;
-	if (m->cap == 0) return false;
-	bool found = false;
-	NAME_find(m, key, &found);
-	return found;
+	return NAME_find((NAME *)o, key) >= 0;
 }
 
 KS_RT VALC NAME_get(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	bool found = false;
-	int64_t i = 0;
-	if (m->cap != 0) i = NAME_find(m, key, &found);
-	if (!found) ks_panic("map key not found");
-	return m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e < 0) ks_panic("map key not found");
+	return m->vals[e];
 }
 
 KS_RT VALC *NAME_slot(ks_obj *o, KEYC key) {
 	NAME *m = (NAME *)o;
-	bool found = false;
-	int64_t i = 0;
-	if (m->cap != 0) i = NAME_find(m, key, &found);
-	if (!found) ks_panic("map key not found");
-	return &m->vals[i];
+	int64_t e = NAME_find(m, key);
+	if (e < 0) ks_panic("map key not found");
+	return &m->vals[e];
 }
 
 KS_RT ks_obj *NAME_keys(ks_obj *o) {
 	NAME *m = (NAME *)o;
 	ks_obj *a = ks_arr_KEYARR_new(m->len);
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		KEYC key = m->keys[i];
 		ks_arr_KEYARR_push(a, KEYRETAIN);
 	}
@@ -1645,8 +1710,8 @@ KS_RT ks_obj *NAME_keys(ks_obj *o) {
 KS_RT ks_obj *NAME_values(ks_obj *o) {
 	NAME *m = (NAME *)o;
 	ks_obj *a = ks_arr_VALARR_new(m->len);
-	for (int64_t i = 0; i < m->cap; i++) {
-		if (m->used[i] != 1) continue;
+	for (int64_t i = 0; i < m->n; i++) {
+		if (!m->alive[i]) continue;
 		VALC v = m->vals[i];
 		ks_arr_VALARR_push(a, VALRETAIN);
 	}

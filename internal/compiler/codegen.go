@@ -77,6 +77,7 @@ func GenerateC(prog *Program) string {
 	sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
 	sb.WriteString("\tsetvbuf(stderr, NULL, _IOLBF, BUFSIZ);\n")
 	sb.WriteString("\tks_init_stack((uintptr_t)__builtin_frame_address(0));\n")
+	sb.WriteString("\tks_init_seed();\n")
 	if prog.Main.Result.Kind == KResult {
 		fmt.Fprintf(&sb, "\tks_obj *ks_rc = %s();\n\tfflush(stdout);\n\treturn ks_main_result(ks_rc);\n", prog.Main.CName)
 	} else if prog.Main.Result == IntType {
@@ -243,7 +244,7 @@ func (g *gen) printFn(t Type) string {
 	} else if t.Kind == KMap {
 		k := mapKind(t)
 		fmt.Fprintf(&sb, "\tks_map_%s *m = (ks_map_%s *)v;\n\tfputc('{', out);\n", k, k)
-		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->cap; i++) {\n\t\tif (m->used[i] != 1) continue;\n\t\tif (shown++ > 0) fputs(\", \", out);\n")
+		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->n; i++) {\n\t\tif (!m->alive[i]) continue;\n\t\tif (shown++ > 0) fputs(\", \", out);\n")
 		fmt.Fprintf(&sb, "\t\t%s\n\t\tfputs(\": \", out);\n\t\t%s\n", g.printValue(t.Key, "m->keys[i]", "out", true), g.printValue(t.Elem, "m->vals[i]", "out", true))
 		sb.WriteString("\t}\n\tfputc('}', out);\n")
 	} else {
