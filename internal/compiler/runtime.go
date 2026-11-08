@@ -1598,6 +1598,428 @@ KS_RT ks_obj *ks_url_decode(ks_obj *so) {
 	return ks_res_ok_obj(r);
 }
 
+KS_RT ks_obj *ks_res_ok_i64(int64_t v);
+KS_RT ks_obj *ks_res_ok_f64(double v);
+KS_RT ks_obj *ks_res_ok_bool(bool v);
+// JSON: documents stay strings. Each call validates the whole document and
+// walks a dotted path ("user.tags.0") to one value. Object keys are matched
+// exactly (the first of duplicate keys wins); array steps are decimal indexes.
+typedef struct {
+	const char *p;
+	const char *start;
+	const char *end;
+	int depth;
+} ks_jp;
+
+KS_RT void ks_jws(ks_jp *j) {
+	while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++;
+}
+
+// ks_jstring parses a string at j->p. If out is not NULL it receives the
+// decoded bytes (out must have room for the raw length).
+KS_RT bool ks_jstring(ks_jp *j, char *out, int64_t *outlen) {
+	if (j->p >= j->end || *j->p != '"') return false;
+	j->p++;
+	int64_t w = 0;
+	while (j->p < j->end) {
+		unsigned char c = (unsigned char)*j->p++;
+		if (c == '"') {
+			if (outlen) *outlen = w;
+			return true;
+		}
+		if (c < 0x20) return false;
+		if (c != '\\') {
+			if (out) out[w] = (char)c;
+			w++;
+			continue;
+		}
+		if (j->p >= j->end) return false;
+		char e = *j->p++;
+		char ch;
+		switch (e) {
+		case '"': ch = '"'; break;
+		case '\\': ch = '\\'; break;
+		case '/': ch = '/'; break;
+		case 'b': ch = '\b'; break;
+		case 'f': ch = '\f'; break;
+		case 'n': ch = '\n'; break;
+		case 'r': ch = '\r'; break;
+		case 't': ch = '\t'; break;
+		case 'u': {
+			uint32_t cp = 0;
+			for (int k = 0; k < 4; k++) {
+				if (j->p >= j->end) return false;
+				int v = ks_hexval(*j->p++);
+				if (v < 0) return false;
+				cp = cp << 4 | (uint32_t)v;
+			}
+			if (cp >= 0xd800 && cp <= 0xdbff && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+				uint32_t lo = 0;
+				bool okhex = true;
+				for (int k = 0; k < 4; k++) {
+					int v = ks_hexval(j->p[2 + k]);
+					if (v < 0) okhex = false;
+					lo = lo << 4 | (uint32_t)(v < 0 ? 0 : v);
+				}
+				if (okhex && lo >= 0xdc00 && lo <= 0xdfff) {
+					j->p += 6;
+					cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+				}
+			}
+			if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+			unsigned char buf[4];
+			int n;
+			if (cp < 0x80) { buf[0] = (unsigned char)cp; n = 1; }
+			else if (cp < 0x800) { buf[0] = (unsigned char)(0xc0 | cp >> 6); buf[1] = (unsigned char)(0x80 | (cp & 0x3f)); n = 2; }
+			else if (cp < 0x10000) { buf[0] = (unsigned char)(0xe0 | cp >> 12); buf[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f)); buf[2] = (unsigned char)(0x80 | (cp & 0x3f)); n = 3; }
+			else { buf[0] = (unsigned char)(0xf0 | cp >> 18); buf[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3f)); buf[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f)); buf[3] = (unsigned char)(0x80 | (cp & 0x3f)); n = 4; }
+			for (int k = 0; k < n; k++) {
+				if (out) out[w] = (char)buf[k];
+				w++;
+			}
+			continue;
+		}
+		default: return false;
+		}
+		if (out) out[w] = ch;
+		w++;
+	}
+	return false;
+}
+
+KS_RT bool ks_jnumber(ks_jp *j, bool *integer) {
+	const char *p = j->p;
+	*integer = true;
+	if (p < j->end && *p == '-') p++;
+	if (p >= j->end) return false;
+	if (*p == '0') p++;
+	else if (*p >= '1' && *p <= '9') { while (p < j->end && ks_is_digit(*p)) p++; }
+	else return false;
+	if (p < j->end && *p == '.') {
+		*integer = false;
+		p++;
+		if (p >= j->end || !ks_is_digit(*p)) return false;
+		while (p < j->end && ks_is_digit(*p)) p++;
+	}
+	if (p < j->end && (*p == 'e' || *p == 'E')) {
+		*integer = false;
+		p++;
+		if (p < j->end && (*p == '+' || *p == '-')) p++;
+		if (p >= j->end || !ks_is_digit(*p)) return false;
+		while (p < j->end && ks_is_digit(*p)) p++;
+	}
+	j->p = p;
+	return true;
+}
+
+KS_RT bool ks_jlit(ks_jp *j, const char *lit) {
+	size_t n = strlen(lit);
+	if ((size_t)(j->end - j->p) < n || memcmp(j->p, lit, n) != 0) return false;
+	j->p += n;
+	return true;
+}
+
+KS_RT bool ks_jskip(ks_jp *j) {
+	ks_jws(j);
+	if (j->p >= j->end) return false;
+	char c = *j->p;
+	if (c == '"') return ks_jstring(j, NULL, NULL);
+	if (c == 't') return ks_jlit(j, "true");
+	if (c == 'f') return ks_jlit(j, "false");
+	if (c == 'n') return ks_jlit(j, "null");
+	if (c == '{' || c == '[') {
+		if (++j->depth > 512) return false;
+		char close = c == '{' ? '}' : ']';
+		j->p++;
+		ks_jws(j);
+		if (j->p < j->end && *j->p == close) {
+			j->p++;
+			j->depth--;
+			return true;
+		}
+		for (;;) {
+			if (c == '{') {
+				ks_jws(j);
+				if (!ks_jstring(j, NULL, NULL)) return false;
+				ks_jws(j);
+				if (j->p >= j->end || *j->p != ':') return false;
+				j->p++;
+			}
+			if (!ks_jskip(j)) return false;
+			ks_jws(j);
+			if (j->p >= j->end) return false;
+			if (*j->p == ',') { j->p++; continue; }
+			if (*j->p == close) { j->p++; j->depth--; return true; }
+			return false;
+		}
+	}
+	bool integer;
+	return ks_jnumber(j, &integer);
+}
+
+KS_RT bool ks_jvalid_raw(ks_str *s, int64_t *errpos) {
+	ks_jp j = {s->data, s->data, s->data + s->len, 0};
+	bool ok = ks_jskip(&j);
+	if (ok) {
+		ks_jws(&j);
+		ok = j.p == j.end;
+	}
+	if (!ok && errpos) *errpos = (int64_t)(j.p - j.start);
+	return ok;
+}
+
+KS_RT bool ks_json_valid(ks_obj *doc) {
+	return ks_jvalid_raw(KS_S(doc), NULL);
+}
+
+// ks_jfind validates doc and positions *out at the value for path. On
+// failure it returns an error result; on success NULL.
+KS_RT ks_obj *ks_jfind(ks_obj *doco, ks_obj *patho, ks_jp *out, bool single_key) {
+	ks_str *doc = KS_S(doco), *path = KS_S(patho);
+	int64_t bad = 0;
+	if (!ks_jvalid_raw(doc, &bad)) return ks_res_errf("json: invalid document at byte %" PRId64, bad);
+	ks_jp j = {doc->data, doc->data, doc->data + doc->len, 0};
+	ks_jws(&j);
+	int64_t i = 0;
+	while ((single_key || path->len > 0) && i <= path->len) {
+		int64_t segend = i;
+		if (single_key) segend = path->len;
+		else while (segend < path->len && path->data[segend] != '.') segend++;
+		const char *seg = path->data + i;
+		int64_t seglen = segend - i;
+		ks_jws(&j);
+		if (*j.p == '{') {
+			j.p++;
+			bool found = false;
+			ks_jws(&j);
+			while (*j.p != '}') {
+				ks_jws(&j);
+				const char *ks = j.p;
+				int64_t klen = 0;
+				char *key = ks_alloc((size_t)(j.end - ks) + 1);
+				ks_jstring(&j, key, &klen);
+				bool match = klen == seglen && (seglen == 0 || memcmp(key, seg, (size_t)seglen) == 0);
+				free(key);
+				ks_jws(&j);
+				j.p++;
+				ks_jws(&j);
+				if (match) {
+					found = true;
+					break;
+				}
+				ks_jskip(&j);
+				ks_jws(&j);
+				if (*j.p == ',') j.p++;
+				ks_jws(&j);
+			}
+			if (!found) return ks_res_errf("json: no key \"%.*s\" at \"%.*s\"", (int)(seglen > 100 ? 100 : seglen), seg, (int)(i > 0 ? i - 1 : 0), path->data);
+		} else if (*j.p == '[') {
+			int64_t idx = 0;
+			if (seglen == 0 || seglen > 18) return ks_res_errf("json: \"%.*s\" is not an array index", (int)(seglen > 100 ? 100 : seglen), seg);
+			for (int64_t k = 0; k < seglen; k++) {
+				if (!ks_is_digit(seg[k])) return ks_res_errf("json: \"%.*s\" is not an array index", (int)(seglen > 100 ? 100 : seglen), seg);
+				idx = idx * 10 + (seg[k] - '0');
+			}
+			j.p++;
+			ks_jws(&j);
+			int64_t at = 0;
+			bool found = false;
+			while (*j.p != ']') {
+				if (at == idx) {
+					found = true;
+					break;
+				}
+				ks_jskip(&j);
+				ks_jws(&j);
+				if (*j.p == ',') j.p++;
+				ks_jws(&j);
+				at++;
+			}
+			if (!found) return ks_res_errf("json: index %" PRId64 " out of range (length %" PRId64 ")", idx, at);
+		} else {
+			return ks_res_errf("json: cannot look up \"%.*s\" in a value that is not an object or array", (int)(seglen > 100 ? 100 : seglen), seg);
+		}
+		if (single_key) break;
+		i = segend + 1;
+	}
+	ks_jws(&j);
+	*out = j;
+	return NULL;
+}
+
+KS_RT const char *ks_jkind(char c) {
+	switch (c) {
+	case '{': return "object";
+	case '[': return "array";
+	case '"': return "string";
+	case 't': case 'f': return "bool";
+	case 'n': return "null";
+	}
+	return "number";
+}
+
+KS_RT ks_obj *ks_json_type(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) {
+		ks_release(e);
+		return ks_str_from("", 0);
+	}
+	return ks_str_cstr(ks_jkind(*j.p));
+}
+
+KS_RT ks_obj *ks_jwrong(ks_obj *path, ks_jp *j, const char *want) {
+	return ks_res_errf("json: \"%.100s\" is %s, not %s", KS_S(path)->data, ks_jkind(*j->p), want);
+}
+
+KS_RT ks_obj *ks_json_string(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '"') return ks_jwrong(path, &j, "a string");
+	char *buf = ks_alloc((size_t)(j.end - j.p) + 1);
+	int64_t n = 0;
+	ks_jstring(&j, buf, &n);
+	ks_obj *r = ks_str_from(buf, n);
+	free(buf);
+	return ks_res_ok_obj(r);
+}
+
+KS_RT ks_obj *ks_json_int(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	const char *start = j.p;
+	bool integer = false;
+	if (strcmp(ks_jkind(*j.p), "number") != 0 || !ks_jnumber(&j, &integer)) return ks_jwrong(path, &j, "an integer");
+	if (!integer) return ks_res_errf("json: \"%.100s\" is not an integer", KS_S(path)->data);
+	ks_obj *num = ks_str_from(start, (int64_t)(j.p - start));
+	int64_t v;
+	bool ok = ks_parse_int_raw(num, &v);
+	ks_release(num);
+	if (!ok) return ks_res_errf("json: \"%.100s\" does not fit in an int", KS_S(path)->data);
+	return ks_res_ok_i64(v);
+}
+
+KS_RT ks_obj *ks_json_float(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	const char *start = j.p;
+	bool integer;
+	if (strcmp(ks_jkind(*j.p), "number") != 0 || !ks_jnumber(&j, &integer)) return ks_jwrong(path, &j, "a number");
+	ks_obj *num = ks_str_from(start, (int64_t)(j.p - start));
+	double v = strtod(KS_S(num)->data, NULL);
+	ks_release(num);
+	return ks_res_ok_f64(v);
+}
+
+KS_RT ks_obj *ks_json_bool(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p == 't') return ks_res_ok_bool(true);
+	if (*j.p == 'f') return ks_res_ok_bool(false);
+	return ks_jwrong(path, &j, "a bool");
+}
+
+KS_RT ks_obj *ks_jraw_at(ks_jp *j) {
+	const char *start = j->p;
+	ks_jskip(j);
+	return ks_res_ok_obj(ks_str_from(start, (int64_t)(j->p - start)));
+}
+
+KS_RT ks_obj *ks_json_raw(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	return ks_jraw_at(&j);
+}
+
+KS_RT ks_obj *ks_json_member(ks_obj *doc, ks_obj *key) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, key, &j, true);
+	if (e != NULL) return e;
+	return ks_jraw_at(&j);
+}
+
+// ks_jitems walks the array or object at j and returns its length, pushing
+// decoded keys onto keys when it is not NULL.
+KS_RT int64_t ks_jitems(ks_jp *j, ks_obj *keys) {
+	char open = *j->p;
+	char close = open == '{' ? '}' : ']';
+	j->p++;
+	ks_jws(j);
+	int64_t n = 0;
+	while (*j->p != close) {
+		if (open == '{') {
+			char *buf = ks_alloc((size_t)(j->end - j->p) + 1);
+			int64_t klen = 0;
+			ks_jstring(j, buf, &klen);
+			if (keys) ks_arr_obj_push(keys, ks_str_from(buf, klen));
+			free(buf);
+			ks_jws(j);
+			j->p++;
+		}
+		ks_jskip(j);
+		ks_jws(j);
+		if (*j->p == ',') j->p++;
+		ks_jws(j);
+		n++;
+	}
+	return n;
+}
+
+KS_RT ks_obj *ks_json_len(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '{' && *j.p != '[') return ks_jwrong(path, &j, "an array or object");
+	return ks_res_ok_i64(ks_jitems(&j, NULL));
+}
+
+KS_RT ks_obj *ks_json_keys(ks_obj *doc, ks_obj *path) {
+	ks_jp j;
+	ks_obj *e = ks_jfind(doc, path, &j, false);
+	if (e != NULL) return e;
+	if (*j.p != '{') return ks_jwrong(path, &j, "an object");
+	ks_obj *keys = ks_arr_obj_new(0);
+	ks_jitems(&j, keys);
+	return ks_res_ok_obj(keys);
+}
+
+KS_RT ks_obj *ks_json_quote(ks_obj *so) {
+	static const char digits[] = "0123456789abcdef";
+	ks_str *s = KS_S(so);
+	if (s->len > (INT64_MAX - 2) / 6) ks_panic("string too long");
+	char *buf = ks_alloc((size_t)s->len * 6 + 3);
+	int64_t w = 0;
+	buf[w++] = '"';
+	for (int64_t i = 0; i < s->len; i++) {
+		unsigned char c = (unsigned char)s->data[i];
+		switch (c) {
+		case '"': buf[w++] = '\\'; buf[w++] = '"'; break;
+		case '\\': buf[w++] = '\\'; buf[w++] = '\\'; break;
+		case '\n': buf[w++] = '\\'; buf[w++] = 'n'; break;
+		case '\r': buf[w++] = '\\'; buf[w++] = 'r'; break;
+		case '\t': buf[w++] = '\\'; buf[w++] = 't'; break;
+		case '\b': buf[w++] = '\\'; buf[w++] = 'b'; break;
+		case '\f': buf[w++] = '\\'; buf[w++] = 'f'; break;
+		default:
+			if (c < 0x20 || c == 0x7f) {
+				buf[w++] = '\\'; buf[w++] = 'u'; buf[w++] = '0'; buf[w++] = '0';
+				buf[w++] = digits[c >> 4]; buf[w++] = digits[c & 15];
+			} else {
+				buf[w++] = (char)c;
+			}
+		}
+	}
+	buf[w++] = '"';
+	ks_obj *r = ks_str_from(buf, w);
+	free(buf);
+	return r;
+}
+
 typedef struct {
 	ks_obj h;
 	bool ok;

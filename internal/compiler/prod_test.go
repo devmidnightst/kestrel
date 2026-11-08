@@ -1,6 +1,9 @@
 package compiler
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -285,5 +288,86 @@ func TestCryptoAndEncoding(t *testing.T) {
 	bad := runWith(t, "fn main() { print(random_int(5, 1)); }", "", false)
 	if bad.code != 101 || !strings.Contains(bad.stderr, "random_int: low 5 is greater than high 1") {
 		t.Errorf("random_int range: %d %q", bad.code, bad.stderr)
+	}
+}
+
+func TestJSON(t *testing.T) {
+	requireCC(t)
+	src := `fn main() -> ! {
+    let doc = "{\"user\": {\"name\": \"N\\u00e9 \\\"q\\\" \\ud83d\\ude00\", \"age\": 41, \"admin\": false, \"tags\": [\"a\", \"b\", {\"deep\": [1.5e2, -0, null]}]},\n \"a.b\": 1, \"big\": 9223372036854775808, \"dup\": 1, \"dup\": 2, \"\": \"empty\"}";
+    print(json_valid(doc), json_valid("{\"a\":}"), json_valid("[1,]"), json_valid("01"), json_valid("\"\\x\""), json_valid(" [ ] "));
+    let name = try json_string(doc, "user.name");
+    print(name, len(name));
+    print(json_int(doc, "user.age"), json_bool(doc, "user.admin"), json_float(doc, "user.tags.2.deep.0"));
+    print(json_len(doc, "user.tags"), json_len(doc, "user"), json_keys(doc, "user"), json_keys(doc, ""));
+    print(json_type(doc, "user.tags.2.deep.2"), json_type(doc, "user.tags.2.deep.1"), json_type(doc, "user.tags"), json_type(doc, "nope"), json_type("{bad", ""));
+    print(json_raw(doc, "user.tags.2"), json_member(doc, "a.b"), json_int(doc, "dup"), json_string(doc, "."));
+    print(json_int(doc, "big"), json_int(doc, "user.tags.2.deep.0"), json_string(doc, "user.age"));
+    print(json_int(doc, "user.nope"), json_int(doc, "user.tags.9"), json_int(doc, "user.tags.x"), json_int(doc, "user.age.x"));
+    print(json_int("{\"a\": [1, 2", "a"));
+    print(json_quote("he said \"hi\"\n\t\\ é \u0001"));
+    let built = "{\"msg\": " + json_quote("a\"b") + "}";
+    print(json_string(built, "msg"));
+    var nested = "1";
+    for i in 0..600 { nested = "[" + nested + "]"; }
+    print(json_valid(nested));
+    return ok();
+}`
+	src = strings.Replace(src, `\u0001`, `" + chr(1) + "`, 1)
+	want := "true false false false false true\n" +
+		"Né \"q\" 😀 12\n" +
+		"ok(41) ok(false) ok(150.0)\n" +
+		"ok(3) ok(4) ok([\"name\", \"age\", \"admin\", \"tags\"]) ok([\"user\", \"a.b\", \"big\", \"dup\", \"dup\", \"\"])\n" +
+		"null number array  \n" +
+		"ok(\"{\\\"deep\\\": [1.5e2, -0, null]}\") ok(\"1\") ok(1) err(\"json: cannot look up \\\"\\\" in a value that is not an object or array\")\n" +
+		"err(\"json: \\\"big\\\" does not fit in an int\") err(\"json: \\\"user.tags.2.deep.0\\\" is not an integer\") err(\"json: \\\"user.age\\\" is number, not a string\")\n" +
+		"err(\"json: no key \\\"nope\\\" at \\\"user\\\"\") err(\"json: index 9 out of range (length 3)\") err(\"json: \\\"x\\\" is not an array index\") err(\"json: cannot look up \\\"x\\\" in a value that is not an object or array\")\n" +
+		"err(\"json: invalid document at byte 11\")\n" +
+		"\"he said \\\"hi\\\"\\n\\t\\\\ é \\u0001\"\n" +
+		"ok(\"a\\\"b\")\n" +
+		"false\n"
+	for _, sanitize := range []bool{false, true} {
+		if sanitize {
+			requireSanitizers(t)
+		}
+		r := runWith(t, src, "", sanitize)
+		if r.code != 0 || r.stdout != want || r.stderr != "" {
+			t.Errorf("sanitize %v: exit %d, stderr %q\ngot:\n%s\nwant:\n%s", sanitize, r.code, r.stderr, r.stdout, want)
+		}
+	}
+}
+
+func TestRuntimeParserFuzz(t *testing.T) {
+	requireSanitizers(t)
+	dir := writeFiles(t, map[string]string{"main.ks": "fn main() { print(json_valid(\"{}\")); }"})
+	if err := Build(filepath.Join(dir, "main.ks"), BuildOptions{Output: filepath.Join(dir, "prog"), EmitC: filepath.Join(dir, "rt.c")}); err != nil {
+		t.Fatal(err)
+	}
+	harness, err := os.ReadFile(filepath.Join("testdata", "fuzz_runtime.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fuzz.c"), harness, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cc, err := FindCC("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := append(append([]string{}, cc[1:]...), "-std=c11", "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined", "-o", "fuzz", "fuzz.c", "-lm")
+	build := exec.Command(cc[0], args...)
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build harness: %v\n%s", err, out)
+	}
+	iters := "30000"
+	if v := os.Getenv("KESTREL_FUZZ_ITERS"); v != "" {
+		iters = v
+	}
+	run := exec.Command(filepath.Join(dir, "fuzz"), iters)
+	run.Env = append(os.Environ(), sanitizerEnv()...)
+	out, err := run.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "done" {
+		t.Fatalf("fuzz: %v\n%s", err, out)
 	}
 }

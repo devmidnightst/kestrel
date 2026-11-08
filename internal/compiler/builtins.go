@@ -81,6 +81,18 @@ var fixedBuiltins = map[string]builtinSig{
 	"url_encode":       {[]Type{StringType}, StringType, "ks_url_encode"},
 	"url_decode":       {[]Type{StringType}, ResultOf(StringType), "ks_url_decode"},
 
+	"json_valid":  {[]Type{StringType}, BoolType, "ks_json_valid"},
+	"json_type":   {[]Type{StringType, StringType}, StringType, "ks_json_type"},
+	"json_string": {[]Type{StringType, StringType}, ResultOf(StringType), "ks_json_string"},
+	"json_int":    {[]Type{StringType, StringType}, ResultOf(IntType), "ks_json_int"},
+	"json_float":  {[]Type{StringType, StringType}, ResultOf(FloatType), "ks_json_float"},
+	"json_bool":   {[]Type{StringType, StringType}, ResultOf(BoolType), "ks_json_bool"},
+	"json_len":    {[]Type{StringType, StringType}, ResultOf(IntType), "ks_json_len"},
+	"json_keys":   {[]Type{StringType, StringType}, ResultOf(stringArray), "ks_json_keys"},
+	"json_raw":    {[]Type{StringType, StringType}, ResultOf(StringType), "ks_json_raw"},
+	"json_member": {[]Type{StringType, StringType}, ResultOf(StringType), "ks_json_member"},
+	"json_quote":  {[]Type{StringType}, StringType, "ks_json_quote"},
+
 	"tcp_listen_shared":   {[]Type{StringType, IntType}, IntType, "ks_tcp_listen_shared"},
 	"tcp_poll":            {[]Type{intArray, IntType}, intArray, "ks_tcp_poll"},
 	"tcp_set_timeout":     {[]Type{IntType, IntType}, BoolType, "ks_tcp_set_timeout"},
