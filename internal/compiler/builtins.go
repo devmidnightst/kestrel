@@ -65,10 +65,14 @@ var fixedBuiltins = map[string]builtinSig{
 	"trap_shutdown":      {nil, Void, "ks_trap_shutdown"},
 	"shutdown_requested": {nil, BoolType, "ks_shutdown_requested"},
 
-	"tcp_listen_shared": {[]Type{StringType, IntType}, IntType, "ks_tcp_listen_shared"},
-	"tcp_poll":          {[]Type{intArray, IntType}, intArray, "ks_tcp_poll"},
-	"tcp_set_timeout":   {[]Type{IntType, IntType}, BoolType, "ks_tcp_set_timeout"},
-	"tcp_peer":          {[]Type{IntType}, StringType, "ks_tcp_peer"},
+	"tcp_listen_shared":   {[]Type{StringType, IntType}, IntType, "ks_tcp_listen_shared"},
+	"tcp_poll":            {[]Type{intArray, IntType}, intArray, "ks_tcp_poll"},
+	"tcp_set_timeout":     {[]Type{IntType, IntType}, BoolType, "ks_tcp_set_timeout"},
+	"tcp_peer":            {[]Type{IntType}, StringType, "ks_tcp_peer"},
+	"tcp_try_accept":      {[]Type{IntType}, IntType, "ks_tcp_try_accept"},
+	"tcp_send":            {[]Type{IntType, StringType}, IntType, "ks_tcp_send"},
+	"tcp_wait":            {[]Type{intArray, intArray, IntType}, ArrayOf(intArray), "ks_tcp_wait"},
+	"tcp_connect_timeout": {[]Type{StringType, IntType, IntType}, IntType, "ks_tcp_connect_timeout"},
 }
 
 var builtinNames = map[string]bool{

@@ -722,6 +722,14 @@ KS_RT int ks_tcp_cloexec(int fd) {
 	return fd;
 }
 
+// Listening sockets are non-blocking so that tcp_try_accept never hangs when
+// another worker took the connection first; tcp_accept waits with poll.
+KS_RT void ks_set_nonblock(int fd, bool on) {
+	int fl = fcntl(fd, F_GETFL);
+	if (fl < 0) return;
+	fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+}
+
 KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode, bool shared) {
 	if (port < 0 || port > 65535) return -1;
 	ks_str *h = KS_S(host);
@@ -759,7 +767,10 @@ KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode, bool sha
 				continue;
 #endif
 			}
-			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
+			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 1024) == 0) {
+				ks_set_nonblock(fd, true);
+				break;
+			}
 		} else if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
 			break;
 		}
@@ -792,11 +803,77 @@ KS_RT int64_t ks_tcp_port(int64_t fd) {
 	return -1;
 }
 
+KS_RT int64_t ks_accept_one(int fd) {
+	int c = accept(fd, NULL, NULL);
+	if (c < 0) return -1;
+	ks_set_nonblock(c, false);
+	return ks_tcp_cloexec(c);
+}
+
 KS_RT int64_t ks_tcp_accept(int64_t fd) {
 	if (fd < 0 || fd > INT32_MAX) return -1;
-	int c = accept((int)fd, NULL, NULL);
-	if (c < 0) return -1;
-	return ks_tcp_cloexec(c);
+	for (;;) {
+		int64_t c = ks_accept_one((int)fd);
+		if (c >= 0) return c;
+		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED) return -1;
+		struct pollfd p = {(int)fd, POLLIN, 0};
+		if (poll(&p, 1, -1) < 0) return -1;
+	}
+}
+
+KS_RT int64_t ks_tcp_try_accept(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	return ks_accept_one((int)fd);
+}
+
+KS_RT int64_t ks_tcp_connect_timeout(ks_obj *host, int64_t port, int64_t ms) {
+	if (port < 0 || port > 65535) return -1;
+	ks_str *h = KS_S(host);
+	if (h->len == 0 || h->len > 255 || memchr(h->data, 0, (size_t)h->len) != NULL) return -1;
+	char portbuf[16];
+	snprintf(portbuf, sizeof portbuf, "%" PRId64, port);
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	struct addrinfo *res = NULL;
+	if (getaddrinfo(h->data, portbuf, &hints, &res) != 0) return -1;
+	int fd = -1;
+	int t = ms < 0 ? -1 : (ms > INT32_MAX ? INT32_MAX : (int)ms);
+	for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd < 0) continue;
+		ks_tcp_cloexec(fd);
+		ks_set_nonblock(fd, true);
+		int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+		if (rc != 0 && errno == EINPROGRESS) {
+			struct pollfd p = {fd, POLLOUT, 0};
+			int err = 0;
+			socklen_t len = sizeof err;
+			if (poll(&p, 1, t) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) rc = 0;
+		}
+		if (rc == 0) {
+			ks_set_nonblock(fd, false);
+			break;
+		}
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(res);
+	return fd;
+}
+
+KS_RT int64_t ks_tcp_send(int64_t fd, ks_obj *data) {
+	if (fd < 0 || fd > INT32_MAX) return -1;
+	ks_str *s = KS_S(data);
+	if (s->len == 0) return 0;
+	int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+	flags |= MSG_NOSIGNAL;
+#endif
+	ssize_t n = send((int)fd, s->data, (size_t)s->len, flags);
+	if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+	return (int64_t)n;
 }
 
 KS_RT ks_obj *ks_tcp_read(int64_t fd, int64_t maxn) {
@@ -917,6 +994,36 @@ KS_RT ks_obj *ks_tcp_poll(ks_obj *fdso, int64_t timeout) {
 	}
 	free(pfd);
 	return r;
+}
+
+KS_RT ks_obj *ks_tcp_wait(ks_obj *ro, ks_obj *wo, int64_t timeout) {
+	ks_arr_i64 *r = (ks_arr_i64 *)ro, *w = (ks_arr_i64 *)wo;
+	if (r->len > (int64_t)INT32_MAX / 2 || w->len > (int64_t)INT32_MAX / 2) ks_panic("tcp_wait: too many sockets");
+	int64_t n = r->len + w->len;
+	struct pollfd *pfd = ks_alloc((size_t)n * sizeof(struct pollfd));
+	for (int64_t i = 0; i < n; i++) {
+		int64_t fd = i < r->len ? r->data[i] : w->data[i - r->len];
+		pfd[i].fd = fd < 0 || fd > INT32_MAX ? -1 : (int)fd;
+		pfd[i].events = i < r->len ? POLLIN : POLLOUT;
+		pfd[i].revents = 0;
+	}
+	int t = timeout < 0 ? -1 : (timeout > INT32_MAX ? INT32_MAX : (int)timeout);
+	int got = poll(pfd, (nfds_t)n, t);
+	ks_obj *readable = ks_arr_i64_new(0), *writable = ks_arr_i64_new(0);
+	if (got > 0) {
+		for (int64_t i = 0; i < n; i++) {
+			if (pfd[i].fd < 0) continue;
+			short want = i < r->len ? POLLIN : POLLOUT;
+			if (!(pfd[i].revents & (want | POLLHUP | POLLERR | POLLNVAL))) continue;
+			if (i < r->len) ks_arr_i64_push(readable, r->data[i]);
+			else ks_arr_i64_push(writable, w->data[i - r->len]);
+		}
+	}
+	free(pfd);
+	ks_obj *out = ks_arr_obj_new(2);
+	ks_arr_obj_push(out, readable);
+	ks_arr_obj_push(out, writable);
+	return out;
 }
 
 KS_RT bool ks_tcp_set_timeout(int64_t fd, int64_t ms) {
