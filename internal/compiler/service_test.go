@@ -3,12 +3,14 @@ package compiler
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -91,7 +93,7 @@ func httpGet(t *testing.T, port, path string) string {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.WriteString(conn, "GET "+path+" HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "GET "+path+" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); err != nil {
 		t.Error(err)
 		return ""
 	}
@@ -102,51 +104,91 @@ func httpGet(t *testing.T, port, path string) string {
 	return string(body)
 }
 
-// TestServiceExample runs examples/http/service.ks, holds one connection
-// open with half a request, serves other clients concurrently, finishes the
-// first request, then stops the service with SIGTERM.
+// startService builds examples/http/service.ks with opts, starts it with
+// env, and returns the port, a stop function that sends SIGTERM and waits,
+// and the stderr buffer.
+func startService(t *testing.T, opts BuildOptions, env ...string) (string, func() error, *lockedWriter) {
+	t.Helper()
+	exe := filepath.Join(t.TempDir(), "service")
+	opts.Output = exe
+	if err := Build(filepath.Join("..", "..", "examples", "http", "service.ks"), opts); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe)
+	cmd.Env = append(os.Environ(), append(append(sanitizerEnv(), "PORT=0", "HOST=127.0.0.1"), env...)...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := &lockedWriter{w: &bytes.Buffer{}}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	if f, ok := stdout.(*os.File); ok {
+		_ = f.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("port: %v stderr %s", err, stderr.String())
+	}
+	stop := func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return err
+		}
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(15 * time.Second):
+			return fmt.Errorf("service did not stop after SIGTERM")
+		}
+	}
+	return strings.TrimSpace(line), stop, stderr
+}
+
+type lockedWriter struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.String()
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// TestServiceExample holds one connection open with half a request, serves
+// other clients concurrently, checks keep-alive, pipelining, the JSON echo
+// endpoint and request rejection, then stops the service with SIGTERM.
 func TestServiceExample(t *testing.T) {
 	requireCC(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("uses SIGTERM")
 	}
-	for _, mode := range []string{"release", "sanitize"} {
+	for _, mode := range []string{"release", "sanitize", "workers"} {
 		t.Run(mode, func(t *testing.T) {
-			opts := BuildOptions{Release: mode == "release", Sanitize: mode == "sanitize"}
+			opts := BuildOptions{Release: mode != "sanitize", Sanitize: mode == "sanitize"}
 			if opts.Sanitize {
 				requireSanitizers(t)
 			}
-			exe := filepath.Join(t.TempDir(), "service")
-			opts.Output = exe
-			if err := Build(filepath.Join("..", "..", "examples", "http", "service.ks"), opts); err != nil {
-				t.Fatal(err)
+			var env []string
+			if mode == "workers" {
+				env = append(env, "WORKERS=3")
 			}
-			cmd := exec.Command(exe)
-			cmd.Env = append(os.Environ(), append(sanitizerEnv(), "PORT=0", "HOST=127.0.0.1")...)
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			done := make(chan error, 1)
-			go func() { done <- cmd.Wait() }()
-			defer func() {
-				if cmd.ProcessState == nil {
-					_ = cmd.Process.Kill()
-				}
-			}()
-			if f, ok := stdout.(*os.File); ok {
-				_ = f.SetDeadline(time.Now().Add(10 * time.Second))
-			}
-			line, err := bufio.NewReader(stdout).ReadString('\n')
-			if err != nil {
-				t.Fatalf("port: %v stderr %s", err, stderr.String())
-			}
-			port := strings.TrimSpace(line)
+			port, stop, stderr := startService(t, opts, env...)
 
 			slow, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
 			if err != nil {
@@ -175,7 +217,43 @@ func TestServiceExample(t *testing.T) {
 			}
 			wg.Wait()
 
-			if _, err := io.WriteString(slow, "TP/1.1\r\n\r\n"); err != nil {
+			// Keep-alive with pipelining: three requests in one write.
+			c, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			req := "GET /health HTTP/1.1\r\nHost: x\r\n\r\n" +
+				"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello" +
+				"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+			if _, err := io.WriteString(c, req); err != nil {
+				t.Fatal(err)
+			}
+			all, err := io.ReadAll(c)
+			c.Close()
+			got := string(all)
+			if err != nil || strings.Count(got, "HTTP/1.1 200 OK") != 3 || !strings.Contains(got, "Connection: keep-alive") ||
+				!strings.Contains(got, `{"bytes": 5, "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "content_type": "text/plain"}`) ||
+				!strings.HasSuffix(got, "hello from kestrel\n") {
+				t.Errorf("pipelined: %v\n%s", err, got)
+			}
+
+			// Malformed and oversized requests get 400 and a closed connection.
+			for _, bad := range []string{"BROKEN\r\n\r\n", "GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999\r\n\r\n", "GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"} {
+				b, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = b.SetDeadline(time.Now().Add(10 * time.Second))
+				_, _ = io.WriteString(b, bad)
+				resp, _ := io.ReadAll(b)
+				b.Close()
+				if !strings.HasPrefix(string(resp), "HTTP/1.1 400 Bad Request") {
+					t.Errorf("bad request %q: %q", bad, resp)
+				}
+			}
+
+			if _, err := io.WriteString(slow, "TP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); err != nil {
 				t.Fatal(err)
 			}
 			body, err := io.ReadAll(slow)
@@ -183,22 +261,178 @@ func TestServiceExample(t *testing.T) {
 				t.Fatalf("slow client: %q %v", body, err)
 			}
 
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-				t.Fatal(err)
+			if err := stop(); err != nil {
+				t.Fatalf("stop: %v\n%s", err, stderr.String())
 			}
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("service exited with %v\n%s", err, stderr.String())
-				}
-			case <-time.After(10 * time.Second):
-				t.Fatalf("service did not stop after SIGTERM\n%s", stderr.String())
+			want := 1
+			if mode == "workers" {
+				want = 3
 			}
-			logs := stderr.String()
-			if strings.Count(logs, " served 127.0.0.1:") != 9 || !strings.Contains(logs, "shut down") {
+			if logs := stderr.String(); strings.Count(logs, "shut down") != want {
 				t.Errorf("logs:\n%s", logs)
 			}
 		})
+	}
+}
+
+// TestServiceLoad sends 2000 keep-alive requests over 50 connections to a
+// release build with 4 workers and requires every one to succeed.
+func TestServiceLoad(t *testing.T) {
+	requireCC(t)
+	if testing.Short() {
+		t.Skip("load test")
+	}
+	port, stop, stderr := startService(t, BuildOptions{Release: true}, "WORKERS=4")
+	const conns, perConn = 50, 40
+	start := time.Now()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	failures := 0
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
+			if err != nil {
+				mu.Lock()
+				failures += perConn
+				mu.Unlock()
+				return
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+			r := bufio.NewReader(c)
+			for j := 0; j < perConn; j++ {
+				if _, err := io.WriteString(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+					mu.Lock()
+					failures++
+					mu.Unlock()
+					return
+				}
+				resp, err := readResponse(r)
+				if err != nil || !strings.HasPrefix(resp, "HTTP/1.1 200 OK") || !strings.HasSuffix(resp, "ok\n") {
+					mu.Lock()
+					failures++
+					mu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	if failures > 0 {
+		t.Errorf("%d of %d requests failed\n%s", failures, conns*perConn, stderr.String())
+	}
+	t.Logf("%d requests over %d connections in %v (%.0f req/s)", conns*perConn, conns, elapsed, float64(conns*perConn)/elapsed.Seconds())
+	if err := stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
+// readResponse reads one response with a Content-Length body.
+func readResponse(r *bufio.Reader) (string, error) {
+	var head strings.Builder
+	length := 0
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return head.String(), err
+		}
+		head.WriteString(line)
+		if line == "\r\n" {
+			break
+		}
+		if v, ok := strings.CutPrefix(line, "Content-Length: "); ok {
+			length, _ = strconv.Atoi(strings.TrimSpace(v))
+		}
+	}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return head.String(), err
+	}
+	return head.String() + string(body), nil
+}
+
+// TestWorkerCrashIsolation crashes one worker with a runtime error and
+// checks that the other workers keep serving and the crashed one is
+// replaced.
+func TestWorkerCrashIsolation(t *testing.T) {
+	requireCC(t)
+	src := `fn main() {
+    let s = tcp_listen("127.0.0.1", 0);
+    trap_shutdown();
+    print(tcp_port(s));
+    let w = fork_workers(2);
+    while !shutdown_requested() {
+        let ready = tcp_wait([s], [], 200);
+        if len(ready[0]) == 0 { continue; }
+        let c = tcp_try_accept(s);
+        if c < 0 { continue; }
+        let req = tcp_read(c, 4096);
+        if starts_with(req, "crash") {
+            let empty: [int] = [];
+            print(empty[0]);
+        }
+        tcp_write(c, "pid " + str(pid()));
+        tcp_close(c);
+    }
+}`
+	dir := writeFiles(t, map[string]string{"main.ks": src})
+	exe := filepath.Join(dir, "prog")
+	if err := Build(filepath.Join(dir, "main.ks"), BuildOptions{Output: exe}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe)
+	stdout, _ := cmd.StdoutPipe()
+	stderr := &lockedWriter{w: &bytes.Buffer{}}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strings.TrimSpace(line)
+	ask := func(msg string) string {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
+		if err != nil {
+			return ""
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = io.WriteString(c, msg)
+		b, _ := io.ReadAll(c)
+		return string(b)
+	}
+	if got := ask("crash"); got != "" {
+		t.Errorf("crash request got %q", got)
+	}
+	for i := 0; i < 20; i++ {
+		if got := ask("hello"); !strings.HasPrefix(got, "pid ") {
+			t.Fatalf("request %d after crash: %q", i, got)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(stderr.String(), "restarting") {
+		time.Sleep(50 * time.Millisecond)
+	}
+	logs := stderr.String()
+	if !strings.Contains(logs, "index out of range") || !strings.Contains(logs, "exited with status 101; restarting") {
+		t.Errorf("logs: %s", logs)
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Errorf("supervisor exit: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Error("supervisor did not stop")
 	}
 }
 

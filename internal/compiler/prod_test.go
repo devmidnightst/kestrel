@@ -371,3 +371,50 @@ func TestRuntimeParserFuzz(t *testing.T) {
 		t.Fatalf("fuzz: %v\n%s", err, out)
 	}
 }
+
+func TestStdImports(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"main.ks": "import \"std:http\";\nimport \"std:http\" as h2;\nfn main() { print(http.status_text(404), h2.status_text(200)); }",
+	})
+	if _, err := Load(filepath.Join(dir, "main.ks")); err != nil {
+		t.Fatalf("std import: %v", err)
+	}
+	for src, want := range map[string]string{
+		"import \"std:nope\";\nfn main() {}":                   "no standard library module \"std:nope\"",
+		"import \"std:../x\";\nfn main() {}":                   "invalid standard library import",
+		"import \"std:Http\";\nfn main() {}":                   "invalid standard library import",
+		"import \"std:http\";\nfn main() { http.max_head(); }": "http.max_head is not public",
+	} {
+		d := writeFiles(t, map[string]string{"main.ks": src})
+		_, err := Load(filepath.Join(d, "main.ks"))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", src, err, want)
+		}
+	}
+	requireCC(t)
+	r := runWith(t, `import "std:http";
+fn main() -> ! {
+    let raw = "POST /a%20b+c?x=1&y=h%C3%A9llo&x=2 HTTP/1.1\r\nHost: e\r\nX-A: 1\r\nx-a: 2\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\n";
+    let n = http.frame(raw, 100);
+    print(n, http.frame("GET / HT", 10), http.frame("GET / HTTP/1.1\r\nContent-Length: 50\r\n\r\n", 10), http.frame("GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", 10));
+    let req = try http.parse(substr(raw, 0, n));
+    print(req.method, req.path, req.query, req.body, req.keep_alive, http.header(req, "X-A"), http.decode_path(req.path));
+    print(http.query_param(req.query, "x"), http.query_param(req.query, "y"), http.query_params(req.query));
+    print(http.parse("GET / HTTP/1.1\r\n\r\n"), http.parse("get / HTTP/1.1\r\nHost: x\r\n\r\n"), http.parse("GET / HTTP/2\r\n\r\n"));
+    print(http.parse("GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n"), http.parse("GET x HTTP/1.1\r\nHost: x\r\n\r\n"));
+    let old = try http.parse("GET / HTTP/1.0\r\n\r\n");
+    print(old.keep_alive);
+    print(http.response(200, {"X-Evil": "a\r\nSet-Cookie: x", "Content-Length": "999"}, "hi", true));
+    return ok();
+}`, "", false)
+	want := "96 0 -1 -1\n" +
+		"POST /a%20b+c x=1&y=h%C3%A9llo&x=2 hello true 1, 2 ok(\"/a b+c\")\n" +
+		"1 héllo {\"x\": \"1\", \"y\": \"héllo\"}\n" +
+		"err(\"missing Host header\") err(\"invalid method\") err(\"unsupported HTTP version\")\n" +
+		"err(\"folded headers are not allowed\") err(\"invalid request target\")\n" +
+		"false\n" +
+		"HTTP/1.1 200 OK\r\nX-Evil: a  Set-Cookie: x\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi\n"
+	if r.code != 0 || r.stdout != want {
+		t.Errorf("exit %d, stderr %q\ngot  %q\nwant %q", r.code, r.stderr, r.stdout, want)
+	}
+}
