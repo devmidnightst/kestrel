@@ -3,6 +3,11 @@ package compiler
 import "strings"
 
 const runtimeHead = `#define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#else
+#define _DEFAULT_SOURCE 1
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -16,7 +21,10 @@ const runtimeHead = `#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__unix__) || defined(__APPLE__)
 #include <arpa/inet.h>
@@ -50,6 +58,7 @@ static uintptr_t ks_stack_base;
 static uintptr_t ks_stack_limit;
 static ks_obj *ks_pending;
 static bool ks_draining;
+static volatile sig_atomic_t ks_shutdown_flag;
 
 __attribute__((noreturn, unused)) static void ks_panic(const char *msg) {
 	fflush(stdout);
@@ -401,39 +410,39 @@ KS_RT ks_obj *ks_str_bool(bool v) {
 	return ks_str_cstr(v ? "true" : "false");
 }
 
-KS_RT void ks_print_i64(int64_t v) {
-	printf("%" PRId64, v);
+KS_RT void ks_print_i64(int64_t v, FILE *out) {
+	fprintf(out, "%" PRId64, v);
 }
 
-KS_RT void ks_print_bool(bool v) {
-	fputs(v ? "true" : "false", stdout);
+KS_RT void ks_print_bool(bool v, FILE *out) {
+	fputs(v ? "true" : "false", out);
 }
 
-KS_RT void ks_print_f64(double v) {
+KS_RT void ks_print_f64(double v, FILE *out) {
 	char buf[48];
 	ks_fmt_float(v, buf, sizeof buf);
-	fputs(buf, stdout);
+	fputs(buf, out);
 }
 
-KS_RT void ks_print_str(ks_obj *s) {
-	if (KS_S(s)->len > 0) fwrite(KS_S(s)->data, 1, (size_t)KS_S(s)->len, stdout);
+KS_RT void ks_print_str(ks_obj *s, FILE *out) {
+	if (KS_S(s)->len > 0) fwrite(KS_S(s)->data, 1, (size_t)KS_S(s)->len, out);
 }
 
-KS_RT void ks_print_str_quoted(ks_obj *o) {
+KS_RT void ks_print_str_quoted(ks_obj *o, FILE *out) {
 	ks_str *s = KS_S(o);
-	putchar('"');
+	fputc('"', out);
 	for (int64_t i = 0; i < s->len; i++) {
 		char c = s->data[i];
 		switch (c) {
-		case '"': fputs("\\\"", stdout); break;
-		case '\\': fputs("\\\\", stdout); break;
-		case '\n': fputs("\\n", stdout); break;
-		case '\t': fputs("\\t", stdout); break;
-		case '\r': fputs("\\r", stdout); break;
-		default: putchar(c);
+		case '"': fputs("\\\"", out); break;
+		case '\\': fputs("\\\\", out); break;
+		case '\n': fputs("\\n", out); break;
+		case '\t': fputs("\\t", out); break;
+		case '\r': fputs("\\r", out); break;
+		default: fputc(c, out);
 		}
 	}
-	putchar('"');
+	fputc('"', out);
 }
 
 KS_RT ks_obj *ks_substr(ks_obj *so, int64_t start, int64_t count) {
@@ -653,10 +662,8 @@ KS_RT const char *ks_cpath(ks_obj *p, const char *fn) {
 	return s->data;
 }
 
-KS_RT ks_obj *ks_read_file(ks_obj *path) {
-	const char *p = ks_cpath(path, "read_file");
-	FILE *f = fopen(p, "rb");
-	if (f == NULL) ks_panicf("read_file: cannot open \"%.200s\": %s", p, strerror(errno));
+// ks_slurp reads all of f into a new string. It returns NULL on a read error.
+KS_RT ks_obj *ks_slurp(FILE *f) {
 	size_t cap = 4096, len = 0;
 	char *buf = ks_alloc(cap);
 	for (;;) {
@@ -670,13 +677,22 @@ KS_RT ks_obj *ks_read_file(ks_obj *path) {
 		if (n == 0) break;
 	}
 	if (ferror(f)) {
-		fclose(f);
-		ks_panicf("read_file: error reading \"%.200s\"", p);
+		free(buf);
+		return NULL;
 	}
-	fclose(f);
 	if (len > (size_t)INT64_MAX) ks_panic("read_file: file too large");
 	ks_obj *r = ks_str_from(buf, (int64_t)len);
 	free(buf);
+	return r;
+}
+
+KS_RT ks_obj *ks_read_file(ks_obj *path) {
+	const char *p = ks_cpath(path, "read_file");
+	FILE *f = fopen(p, "rb");
+	if (f == NULL) ks_panicf("read_file: cannot open \"%.200s\": %s", p, strerror(errno));
+	ks_obj *r = ks_slurp(f);
+	fclose(f);
+	if (r == NULL) ks_panicf("read_file: error reading \"%.200s\"", p);
 	return r;
 }
 
@@ -704,7 +720,7 @@ KS_RT int ks_tcp_cloexec(int fd) {
 	return fd;
 }
 
-KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode) {
+KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode, bool shared) {
 	if (port < 0 || port > 65535) return -1;
 	ks_str *h = KS_S(host);
 	if (h->len == 0 || h->len > 255 || memchr(h->data, 0, (size_t)h->len) != NULL) return -1;
@@ -728,6 +744,19 @@ KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode) {
 		if (listen_mode) {
 			int one = 1;
 			setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+			if (shared) {
+#ifdef SO_REUSEPORT
+				if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0) {
+					close(fd);
+					fd = -1;
+					continue;
+				}
+#else
+				close(fd);
+				fd = -1;
+				continue;
+#endif
+			}
 			if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
 		} else if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
 			break;
@@ -740,11 +769,15 @@ KS_RT int64_t ks_tcp_open(ks_obj *host, int64_t port, bool listen_mode) {
 }
 
 KS_RT int64_t ks_tcp_listen(ks_obj *host, int64_t port) {
-	return ks_tcp_open(host, port, true);
+	return ks_tcp_open(host, port, true, false);
+}
+
+KS_RT int64_t ks_tcp_listen_shared(ks_obj *host, int64_t port) {
+	return ks_tcp_open(host, port, true, true);
 }
 
 KS_RT int64_t ks_tcp_connect(ks_obj *host, int64_t port) {
-	return ks_tcp_open(host, port, false);
+	return ks_tcp_open(host, port, false, false);
 }
 
 KS_RT int64_t ks_tcp_port(int64_t fd) {
@@ -860,6 +893,257 @@ KS_RT ks_obj *ks_fmt(ks_obj *fmto, int64_t n, ks_obj **args) {
 		d[w++] = c;
 	}
 	return r;
+}
+
+KS_RT ks_obj *ks_tcp_poll(ks_obj *fdso, int64_t timeout) {
+	ks_arr_i64 *a = (ks_arr_i64 *)fdso;
+	ks_obj *r = ks_arr_i64_new(0);
+	if ((uint64_t)a->len > SIZE_MAX / sizeof(struct pollfd) || a->len > (int64_t)INT32_MAX) ks_panic("tcp_poll: too many sockets");
+	struct pollfd *pfd = ks_alloc((size_t)a->len * sizeof(struct pollfd));
+	for (int64_t i = 0; i < a->len; i++) {
+		int64_t fd = a->data[i];
+		pfd[i].fd = fd < 0 || fd > INT32_MAX ? -1 : (int)fd;
+		pfd[i].events = POLLIN;
+		pfd[i].revents = 0;
+	}
+	int t = timeout < 0 ? -1 : (timeout > INT32_MAX ? INT32_MAX : (int)timeout);
+	int n = poll(pfd, (nfds_t)a->len, t);
+	if (n > 0) {
+		for (int64_t i = 0; i < a->len; i++) {
+			if (pfd[i].fd >= 0 && (pfd[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) ks_arr_i64_push(r, a->data[i]);
+		}
+	}
+	free(pfd);
+	return r;
+}
+
+KS_RT bool ks_tcp_set_timeout(int64_t fd, int64_t ms) {
+	if (fd < 0 || fd > INT32_MAX) return false;
+	if (ms < 0) ms = 0;
+	struct timeval tv;
+	tv.tv_sec = (time_t)(ms / 1000);
+	tv.tv_usec = (int)((ms % 1000) * 1000);
+	return setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0 &&
+		setsockopt((int)fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0;
+}
+
+KS_RT ks_obj *ks_tcp_peer(int64_t fd) {
+	if (fd < 0 || fd > INT32_MAX) return ks_str_from("", 0);
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof ss;
+	if (getpeername((int)fd, (struct sockaddr *)&ss, &len) != 0) return ks_str_from("", 0);
+	char host[INET6_ADDRSTRLEN];
+	char buf[INET6_ADDRSTRLEN + 16];
+	int n;
+	if (ss.ss_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+		if (inet_ntop(AF_INET, &sin->sin_addr, host, sizeof host) == NULL) return ks_str_from("", 0);
+		n = snprintf(buf, sizeof buf, "%s:%u", host, (unsigned)ntohs(sin->sin_port));
+	} else if (ss.ss_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+		if (inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof host) == NULL) return ks_str_from("", 0);
+		n = snprintf(buf, sizeof buf, "[%s]:%u", host, (unsigned)ntohs(sin6->sin6_port));
+	} else {
+		return ks_str_from("", 0);
+	}
+	return ks_str_from(buf, n);
+}
+
+KS_RT ks_obj *ks_getenv(ks_obj *name) {
+	ks_str *s = KS_S(name);
+	if (s->len == 0 || memchr(s->data, 0, (size_t)s->len) != NULL) return ks_str_from("", 0);
+	const char *v = getenv(s->data);
+	return ks_str_cstr(v != NULL ? v : "");
+}
+
+KS_RT bool ks_has_env(ks_obj *name) {
+	ks_str *s = KS_S(name);
+	if (s->len == 0 || memchr(s->data, 0, (size_t)s->len) != NULL) return false;
+	return getenv(s->data) != NULL;
+}
+
+KS_RT int64_t ks_clock_read(clockid_t id) {
+	struct timespec ts;
+	if (clock_gettime(id, &ts) != 0) return 0;
+	return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+KS_RT int64_t ks_time_ms(void) {
+	return ks_clock_read(CLOCK_REALTIME);
+}
+
+KS_RT int64_t ks_clock_ms(void) {
+	return ks_clock_read(CLOCK_MONOTONIC);
+}
+
+KS_RT void ks_sleep_ms(int64_t ms) {
+	if (ms <= 0) return;
+	struct timespec ts, rem;
+	ts.tv_sec = (time_t)(ms / 1000);
+	ts.tv_nsec = (long)((ms % 1000) * 1000000);
+	fflush(stdout);
+	while (nanosleep(&ts, &rem) != 0 && errno == EINTR && !ks_shutdown_flag) ts = rem;
+}
+
+KS_RT int64_t ks_pid(void) {
+	return (int64_t)getpid();
+}
+
+static void ks_on_shutdown(int sig) {
+	(void)sig;
+	ks_shutdown_flag = 1;
+}
+
+KS_RT void ks_trap_shutdown(void) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = ks_on_shutdown;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+KS_RT bool ks_shutdown_requested(void) {
+	return ks_shutdown_flag != 0;
+}
+
+typedef struct {
+	ks_obj h;
+	bool ok;
+	bool managed;
+	union {
+		int64_t i;
+		double f;
+		bool b;
+		ks_obj *o;
+	} v;
+	ks_obj *msg;
+} ks_res;
+
+KS_RT void ks_res_drop(ks_obj *o) {
+	ks_res *r = (ks_res *)o;
+	if (r->managed) ks_release(r->v.o);
+	if (r->msg != NULL) ks_release(r->msg);
+	free(o);
+}
+
+KS_RT ks_obj *ks_res_clone(ks_obj *o);
+
+KS_RT ks_res *ks_res_new(bool ok) {
+	ks_res *r = ks_alloc(sizeof *r);
+	ks_init_obj(&r->h, ks_res_drop, ks_res_clone);
+	r->ok = ok;
+	r->managed = false;
+	r->v.o = NULL;
+	r->msg = NULL;
+	return r;
+}
+
+KS_RT ks_obj *ks_res_clone(ks_obj *o) {
+	ks_res *a = (ks_res *)o;
+	ks_res *c = ks_res_new(a->ok);
+	c->managed = a->managed;
+	c->v = a->v;
+	if (c->managed) ks_retain(c->v.o);
+	if (a->msg != NULL) c->msg = ks_retain(a->msg);
+	return &c->h;
+}
+
+KS_RT ks_obj *ks_res_ok_i64(int64_t v) { ks_res *r = ks_res_new(true); r->v.i = v; return &r->h; }
+KS_RT ks_obj *ks_res_ok_f64(double v) { ks_res *r = ks_res_new(true); r->v.f = v; return &r->h; }
+KS_RT ks_obj *ks_res_ok_bool(bool v) { ks_res *r = ks_res_new(true); r->v.b = v; return &r->h; }
+KS_RT ks_obj *ks_res_ok_void(void) { return &ks_res_new(true)->h; }
+
+// ks_res_ok_obj takes ownership of v.
+KS_RT ks_obj *ks_res_ok_obj(ks_obj *v) {
+	ks_res *r = ks_res_new(true);
+	r->managed = true;
+	r->v.o = v;
+	return &r->h;
+}
+
+KS_RT ks_obj *ks_res_err(ks_obj *msg) {
+	ks_res *r = ks_res_new(false);
+	r->msg = ks_retain(msg);
+	return &r->h;
+}
+
+__attribute__((unused, format(printf, 1, 2))) static ks_obj *ks_res_errf(const char *fmt, ...) {
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof buf, fmt, ap);
+	va_end(ap);
+	ks_res *r = ks_res_new(false);
+	r->msg = ks_str_cstr(buf);
+	return &r->h;
+}
+
+KS_RT ks_obj *ks_res_error(ks_obj *o) {
+	ks_res *r = (ks_res *)o;
+	if (r->ok) return ks_str_from("", 0);
+	return ks_retain(r->msg);
+}
+
+KS_RT void ks_res_check(ks_obj *o) {
+	ks_res *r = (ks_res *)o;
+	if (!r->ok) ks_panicf("unwrap of an error: %.400s", KS_S(r->msg)->data);
+}
+
+KS_RT int ks_main_result(ks_obj *o) {
+	ks_res *r = (ks_res *)o;
+	int code = 0;
+	if (!r->ok) {
+		fputs("kestrel: error: ", stderr);
+		ks_print_str(r->msg, stderr);
+		fputc('\n', stderr);
+		fflush(stderr);
+		code = 1;
+	}
+	ks_release(o);
+	return code;
+}
+
+KS_RT ks_obj *ks_try_read_file(ks_obj *path) {
+	ks_str *s = KS_S(path);
+	if (s->len == 0) return ks_res_errf("read_file: empty path");
+	if (memchr(s->data, 0, (size_t)s->len) != NULL) return ks_res_errf("read_file: path contains a NUL byte");
+	FILE *f = fopen(s->data, "rb");
+	if (f == NULL) return ks_res_errf("cannot open \"%.200s\": %s", s->data, strerror(errno));
+	ks_obj *data = ks_slurp(f);
+	int e = errno;
+	fclose(f);
+	if (data == NULL) return ks_res_errf("error reading \"%.200s\": %s", s->data, strerror(e));
+	return ks_res_ok_obj(data);
+}
+
+KS_RT ks_obj *ks_try_write_file(ks_obj *path, ks_obj *content) {
+	ks_str *s = KS_S(path);
+	if (s->len == 0) return ks_res_errf("write_file: empty path");
+	if (memchr(s->data, 0, (size_t)s->len) != NULL) return ks_res_errf("write_file: path contains a NUL byte");
+	FILE *f = fopen(s->data, "wb");
+	if (f == NULL) return ks_res_errf("cannot create \"%.200s\": %s", s->data, strerror(errno));
+	ks_str *c = KS_S(content);
+	bool ok = c->len == 0 || fwrite(c->data, 1, (size_t)c->len, f) == (size_t)c->len;
+	int e = errno;
+	if (fclose(f) != 0) {
+		ok = false;
+		e = errno;
+	}
+	if (!ok) return ks_res_errf("error writing \"%.200s\": %s", s->data, strerror(e));
+	return ks_res_ok_void();
+}
+
+KS_RT ks_obj *ks_try_parse_int(ks_obj *s) {
+	int64_t v;
+	if (!ks_parse_int_raw(s, &v)) return ks_res_errf("invalid integer \"%.100s\"", KS_S(s)->data);
+	return ks_res_ok_i64(v);
+}
+
+KS_RT ks_obj *ks_try_parse_float(ks_obj *s) {
+	if (!ks_is_float(s)) return ks_res_errf("invalid number \"%.100s\"", KS_S(s)->data);
+	return ks_res_ok_f64(strtod(KS_S(s)->data, NULL));
 }
 `
 

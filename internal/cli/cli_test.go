@@ -157,3 +157,48 @@ func TestSanitizeFlag(t *testing.T) {
 		t.Errorf("out %q, stderr %q", out, errOut)
 	}
 }
+
+func TestBuildFlags(t *testing.T) {
+	o, err := parseOptions("build", []string{"a.ks", "--release", "--static", "--cflags", "-DX=1 -DY", "--ldflags", "-lz", "--cflags", "-g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.release || !o.static || strings.Join(o.cflags, " ") != "-DX=1 -DY -g" || strings.Join(o.ldflags, " ") != "-lz" {
+		t.Errorf("parsed %+v", o)
+	}
+	b := o.build("out", "")
+	if !b.Release || !b.Static || len(b.CFlags) != 3 || b.Output != "out" {
+		t.Errorf("build options %+v", b)
+	}
+	if _, err := parseOptions("run", []string{"a.ks", "--release", "--", "--static"}); err != nil {
+		t.Errorf("run with release: %v", err)
+	}
+	if code, _, errOut := runCLI("build", "a.ks", "--sanitize", "--release"); code != 2 || !strings.Contains(errOut, "cannot be combined") {
+		t.Errorf("sanitize+release: code %d, stderr %q", code, errOut)
+	}
+	if code, _, errOut := runCLI("check", "a.ks", "--release"); code != 2 || !strings.Contains(errOut, "unknown flag --release") {
+		t.Errorf("check --release: code %d, stderr %q", code, errOut)
+	}
+	if code, _, errOut := runCLI("build", "a.ks", "--cflags"); code != 2 || !strings.Contains(errOut, "flag --cflags needs a value") {
+		t.Errorf("missing cflags value: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestReleaseBuildCLI(t *testing.T) {
+	requireCC(t)
+	src := writeSource(t, "app.ks", "fn main() -> ! { eprint(\"log line\"); print(\"hi\"); return ok(); }")
+	out := filepath.Join(filepath.Dir(src), "app")
+	if code, _, errOut := runCLI("build", src, "-o", out, "--release"); code != 0 {
+		t.Fatalf("build --release: %d %s", code, errOut)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(out)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil || stdout.String() != "hi\n" || stderr.String() != "log line\n" {
+		t.Errorf("run: %v %q %q", err, stdout.String(), stderr.String())
+	}
+	code, runOut, runErr := runCLI("run", src, "--release")
+	if code != 0 || runOut != "hi\n" || runErr != "log line\n" {
+		t.Errorf("run --release: %d %q %q", code, runOut, runErr)
+	}
+}

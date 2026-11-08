@@ -47,4 +47,25 @@ jobs:
           go build -o kestrel ./cmd/kestrel
           for f in examples/*.ks examples/modules/main.ks; do
             ./kestrel run "$f" < /dev/null > /dev/null
+            ./kestrel run --release "$f" < /dev/null > /dev/null
           done
+          ./kestrel build --release examples/http/service.ks -o service
+      - name: install script syntax
+        run: sh -n install.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: builder image
+        run: docker build -t kestrel .
+      - name: app image
+        run: docker build -t hello-service -f examples/deploy/Dockerfile examples/http
+      - name: smoke test
+        run: |
+          docker run -d --name svc -p 8080:8080 hello-service
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8080/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/ | grep -q "hello from kestrel"
+          docker stop -t 10 svc
+          test "$(docker inspect -f '{{.State.ExitCode}}' svc)" = 0
+          docker logs svc 2>&1 | grep -q "shut down"

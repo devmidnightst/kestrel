@@ -75,8 +75,11 @@ func GenerateC(prog *Program) string {
 	sb.WriteString("\nint main(int argc, char **argv) {\n")
 	sb.WriteString("\tks_argc = argc;\n\tks_argv = argv;\n")
 	sb.WriteString("\tsetvbuf(stdout, NULL, _IOLBF, BUFSIZ);\n")
+	sb.WriteString("\tsetvbuf(stderr, NULL, _IOLBF, BUFSIZ);\n")
 	sb.WriteString("\tks_init_stack((uintptr_t)__builtin_frame_address(0));\n")
-	if prog.Main.Result == IntType {
+	if prog.Main.Result.Kind == KResult {
+		fmt.Fprintf(&sb, "\tks_obj *ks_rc = %s();\n\tfflush(stdout);\n\treturn ks_main_result(ks_rc);\n", prog.Main.CName)
+	} else if prog.Main.Result == IntType {
 		fmt.Fprintf(&sb, "\tint64_t ks_rc = %s();\n\tfflush(stdout);\n\treturn (int)ks_rc;\n", prog.Main.CName)
 	} else {
 		fmt.Fprintf(&sb, "\t%s();\n\tfflush(stdout);\n\treturn 0;\n", prog.Main.CName)
@@ -93,7 +96,7 @@ func cType(t Type) string {
 		return "bool"
 	case KFloat:
 		return "double"
-	case KString, KArray, KMap, KStruct:
+	case KString, KArray, KMap, KStruct, KResult:
 		return "ks_obj *"
 	}
 	return "void"
@@ -105,7 +108,7 @@ func zeroValue(t Type) string {
 		return "false"
 	case KFloat:
 		return "0.0"
-	case KString, KArray, KMap, KStruct:
+	case KString, KArray, KMap, KStruct, KResult:
 		return "NULL"
 	}
 	return "0"
@@ -176,28 +179,43 @@ func (g *gen) literal(s string) string {
 	return name
 }
 
-func printScalar(t Type, x string, quoted bool) string {
+// Print helpers write to the C stream named by out (stdout, stderr, or the
+// out parameter of a generated print function).
+func printScalar(t Type, x, out string, quoted bool) string {
 	switch t.Kind {
 	case KInt:
-		return fmt.Sprintf("ks_print_i64(%s);", x)
+		return fmt.Sprintf("ks_print_i64(%s, %s);", x, out)
 	case KBool:
-		return fmt.Sprintf("ks_print_bool(%s);", x)
+		return fmt.Sprintf("ks_print_bool(%s, %s);", x, out)
 	case KFloat:
-		return fmt.Sprintf("ks_print_f64(%s);", x)
+		return fmt.Sprintf("ks_print_f64(%s, %s);", x, out)
 	case KString:
 		if quoted {
-			return fmt.Sprintf("ks_print_str_quoted(%s);", x)
+			return fmt.Sprintf("ks_print_str_quoted(%s, %s);", x, out)
 		}
-		return fmt.Sprintf("ks_print_str(%s);", x)
+		return fmt.Sprintf("ks_print_str(%s, %s);", x, out)
 	}
 	return ""
 }
 
-func (g *gen) printValue(t Type, x string, quoted bool) string {
-	if t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct {
-		return fmt.Sprintf("%s(%s);", g.printFn(t), x)
+func (g *gen) printValue(t Type, x, out string, quoted bool) string {
+	if t.Kind == KArray || t.Kind == KMap || t.Kind == KStruct || t.Kind == KResult {
+		return fmt.Sprintf("%s(%s, %s);", g.printFn(t), x, out)
 	}
-	return printScalar(t, x, quoted)
+	return printScalar(t, x, out, quoted)
+}
+
+// resField names the payload of a ks_res for a value of type t.
+func resField(t Type) string {
+	switch t.Kind {
+	case KInt:
+		return "v.i"
+	case KBool:
+		return "v.b"
+	case KFloat:
+		return "v.f"
+	}
+	return "v.o"
 }
 
 func (g *gen) printFn(t Type) string {
@@ -206,35 +224,43 @@ func (g *gen) printFn(t Type) string {
 	}
 	name := fmt.Sprintf("ks_print_t%d", len(g.printFns))
 	g.printFns[t] = name
-	fmt.Fprintf(&g.printProto, "static void %s(ks_obj *v);\n", name)
+	fmt.Fprintf(&g.printProto, "static void %s(ks_obj *v, FILE *out);\n", name)
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "\nstatic void %s(ks_obj *v) {\n\tks_stack_check();\n", name)
-	if t.Kind == KArray {
+	fmt.Fprintf(&sb, "\nstatic void %s(ks_obj *v, FILE *out) {\n\tks_stack_check();\n", name)
+	if t.Kind == KResult {
+		sb.WriteString("\tks_res *r = (ks_res *)v;\n\tif (r->ok) {\n")
+		if t.Elem == Void {
+			sb.WriteString("\t\tfputs(\"ok()\", out);\n")
+		} else {
+			fmt.Fprintf(&sb, "\t\tfputs(\"ok(\", out);\n\t\t%s\n\t\tfputc(')', out);\n", g.printValue(t.Elem, "r->"+resField(t.Elem), "out", true))
+		}
+		sb.WriteString("\t} else {\n\t\tfputs(\"err(\", out);\n\t\tks_print_str_quoted(r->msg, out);\n\t\tfputc(')', out);\n\t}\n")
+	} else if t.Kind == KArray {
 		k := arrKind(t.Elem)
-		fmt.Fprintf(&sb, "\tks_arr_%s *a = (ks_arr_%s *)v;\n\tputchar('[');\n", k, k)
-		sb.WriteString("\tfor (int64_t i = 0; i < a->len; i++) {\n\t\tif (i > 0) fputs(\", \", stdout);\n")
-		fmt.Fprintf(&sb, "\t\t%s\n\t}\n\tputchar(']');\n", g.printValue(t.Elem, "a->data[i]", true))
+		fmt.Fprintf(&sb, "\tks_arr_%s *a = (ks_arr_%s *)v;\n\tfputc('[', out);\n", k, k)
+		sb.WriteString("\tfor (int64_t i = 0; i < a->len; i++) {\n\t\tif (i > 0) fputs(\", \", out);\n")
+		fmt.Fprintf(&sb, "\t\t%s\n\t}\n\tfputc(']', out);\n", g.printValue(t.Elem, "a->data[i]", "out", true))
 	} else if t.Kind == KMap {
 		k := mapKind(t)
-		fmt.Fprintf(&sb, "\tks_map_%s *m = (ks_map_%s *)v;\n\tputchar('{');\n", k, k)
-		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->cap; i++) {\n\t\tif (m->used[i] != 1) continue;\n\t\tif (shown++ > 0) fputs(\", \", stdout);\n")
-		fmt.Fprintf(&sb, "\t\t%s\n\t\tfputs(\": \", stdout);\n\t\t%s\n", g.printValue(t.Key, "m->keys[i]", true), g.printValue(t.Elem, "m->vals[i]", true))
-		sb.WriteString("\t}\n\tputchar('}');\n")
+		fmt.Fprintf(&sb, "\tks_map_%s *m = (ks_map_%s *)v;\n\tfputc('{', out);\n", k, k)
+		sb.WriteString("\tint64_t shown = 0;\n\tfor (int64_t i = 0; i < m->cap; i++) {\n\t\tif (m->used[i] != 1) continue;\n\t\tif (shown++ > 0) fputs(\", \", out);\n")
+		fmt.Fprintf(&sb, "\t\t%s\n\t\tfputs(\": \", out);\n\t\t%s\n", g.printValue(t.Key, "m->keys[i]", "out", true), g.printValue(t.Elem, "m->vals[i]", "out", true))
+		sb.WriteString("\t}\n\tfputc('}', out);\n")
 	} else {
 		si := t.Struct
 		fmt.Fprintf(&sb, "\t%s *s = (%s *)v;\n\t(void)s;\n", si.CName, si.CName)
 		if len(si.Fields) == 0 {
-			fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n", cString(si.Name+" {}"))
+			fmt.Fprintf(&sb, "\tfputs(%s, out);\n", cString(si.Name+" {}"))
 		} else {
-			fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n", cString(si.Name+" { "))
+			fmt.Fprintf(&sb, "\tfputs(%s, out);\n", cString(si.Name+" { "))
 			for i, f := range si.Fields {
 				prefix := f.Name + ": "
 				if i > 0 {
 					prefix = ", " + prefix
 				}
-				fmt.Fprintf(&sb, "\tfputs(%s, stdout);\n\t%s\n", cString(prefix), g.printValue(f.Type, "s->f_"+f.Name, true))
+				fmt.Fprintf(&sb, "\tfputs(%s, out);\n\t%s\n", cString(prefix), g.printValue(f.Type, "s->f_"+f.Name, "out", true))
 			}
-			sb.WriteString("\tfputs(\" }\", stdout);\n")
+			sb.WriteString("\tfputs(\" }\", out);\n")
 		}
 	}
 	sb.WriteString("}\n")

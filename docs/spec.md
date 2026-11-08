@@ -1,4 +1,4 @@
-# Kestrel Language Specification (v0.2)
+# Kestrel Language Specification (v0.3)
 
 This document describes what the Kestrel compiler in this repository actually
 implements. Anything not listed here is not supported. Kestrel is a young
@@ -22,8 +22,8 @@ production track record, and this document makes no performance promises.
 ## Lexical elements
 
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*` (ASCII only).
-- Keywords: `fn pub struct let var if else while for in return print true
-  false import as break continue`.
+- Keywords: `fn pub struct let var if else while for in return print eprint
+  true false import as break continue try`.
 - Integer literals: decimal digits, `0` to `9223372036854775807`. `-5` is unary
   minus applied to `5`; as a special case `-9223372036854775808` is accepted.
 - Float literals: `1.5`, `0.25`, `2e10`, `1.5e-3`. A literal needs digits on
@@ -45,6 +45,8 @@ production track record, and this document makes no performance promises.
 | `{K: V}`    | map from `string` or `int` keys to `V`                          |
 | `Name`      | a struct declared in the same module                            |
 | `mod.Name`  | a `pub struct` declared in an imported module                   |
+| `!T`        | a result: either `ok` with a value of type `T`, or `err` with a message |
+| `!`         | a result that carries no value: `ok()` or `err` with a message  |
 
 There are no implicit conversions: `1 + 1.0` is an error; write
 `float(1) + 1.0`.
@@ -88,7 +90,8 @@ function  = [ "pub" ] "fn" [ receiver ] signature block .
 receiver  = "(" [ "var" ] IDENT ":" type ")" .
 signature = IDENT "(" [ param { "," param } ] ")" [ "->" type ] .
 param     = IDENT ":" type .
-type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
+type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ]
+          | "!" [ type ] .
 ```
 
 - Imports come before all declarations. There are no global variables or
@@ -103,8 +106,10 @@ type      = "[" type "]" | "{" type ":" type "}" | IDENT [ "." IDENT ] .
   may use the same name as a function, because `total(x)` and `x.total()`
   are different calls. A method may not use the name of a field.
 - The entry file must define `fn main()` with no parameters, returning nothing
-  (exit status 0) or `int` (the process exit status, truncated by the operating
-  system). Use `args()` for command-line arguments.
+  (exit status 0), `int` (the process exit status, truncated by the operating
+  system) or `!`. When `main` returns `err(message)` the program prints
+  `kestrel: error: message` to standard error and exits with status 1; `ok()`
+  exits with status 0. Use `args()` for command-line arguments.
 
 ## Methods
 
@@ -148,9 +153,9 @@ statement = ("let" | "var") IDENT [ ":" type ] "=" expr ";"
           | "while" expr block
           | "for" IDENT "in" expr [ ".." [ "=" ] expr ] block
           | "return" [ expr ] ";"
-          | "print" "(" [ expr { "," expr } ] ")" ";"
+          | ( "print" | "eprint" ) "(" [ expr { "," expr } ] ")" ";"
           | "break" ";" | "continue" ";"
-          | call ";"
+          | [ "try" ] call ";"
           | block .
 place     = IDENT { "[" expr "]" | "." IDENT } .
 ```
@@ -182,8 +187,10 @@ place     = IDENT { "[" expr "]" | "." IDENT } .
   inside arrays, maps and structs. Arrays print as `[1, 2]`, maps as
   `{"a": 1}` in the same order as `keys`, structs as `Point { x: 1.0, y: 2.0 }`.
   Floats print in the shortest form that reads
-  back as the same value, with `.0` added to whole numbers. Standard output
-  is line buffered.
+  back as the same value, with `.0` added to whole numbers. Results print as
+  `ok(5)`, `ok()` and `err("message")`. Standard output is line buffered.
+- `eprint` is `print` to standard error, which is also line buffered. Use it
+  for logs and diagnostics so they stay out of a program's output.
 
 ### for
 
@@ -218,6 +225,48 @@ for x in items { }    // x is each element of an array
 - A struct literal in the `for` header must be wrapped in parentheses, same
   as in an `if` or `while` condition. `for x in [item { n: 1 }]` is fine
   because the literal is inside the array.
+
+## Results and errors
+
+A function that can fail returns a result type. `!T` holds either a value of
+type `T` or an error message; `!` holds either nothing or an error message.
+
+```
+fn parse_port(s: string) -> !int {
+    let n = try try_parse_int(s);      // returns the error to our caller
+    if n < 1 || n > 65535 {
+        return err(fmt("port {} out of range", n));
+    }
+    return ok(n);
+}
+
+fn main() -> ! {
+    let port = try parse_port(getenv("PORT"));
+    print(port);
+    return ok();
+}
+```
+
+- `ok(v)` builds an `!T` from a value of type `T`; `ok()` builds a `!`.
+  `err(message)` builds an error of whatever result type is expected there:
+  a `return` in a function returning a result, an annotated `let`, a
+  parameter, a field, an element. `let r = err("x");` without an annotation
+  is an error because the type is unknown.
+- `try e` requires `e` to be a result. If it is `ok`, `try e` is the value
+  (nothing for `!`). If it is an error, the enclosing function returns that
+  error at once, releasing everything it holds, as a `return` would. The
+  enclosing function must itself return a result type (any one: the error
+  message carries over).
+- `try` must be the whole value of a `let`, `var`, assignment, `return` or
+  call statement: `let x = try f();`, `x = try f();`, `try g();`. It cannot
+  be nested inside a larger expression (`1 + try f()` is an error); bind the
+  value first.
+- Result types cannot be nested (`!!int`), compared with `==`, passed to
+  `str` or `fmt`, or have methods. They can be stored in variables, arrays,
+  maps and struct fields, and printed.
+- Inspect a result with `is_ok`, `is_err`, `error`, `unwrap` and `unwrap_or`
+  (see the builtin table). `unwrap` of an error is a runtime error.
+- Errors are messages, not types: there is no matching on error kinds.
 
 ## Expressions
 
@@ -294,10 +343,72 @@ User functions may shadow builtin names.
 | `values(m) -> [V]` | the map's values, in the same order as `keys` |
 | `exit(code: int)` | flush standard output and exit immediately |
 | `assert(cond: bool, message: string)` | runtime error with the message if `cond` is false |
+| `ok(v) -> !T`, `ok() -> !` | a successful result |
+| `err(message) -> !T` | an error result of the expected result type |
+| `is_ok(r) -> bool`, `is_err(r) -> bool` | which kind of result `r` is |
+| `error(r) -> string` | the error message, or `""` for `ok` |
+| `unwrap(r) -> T` | the value; runtime error `unwrap of an error: message` for `err` |
+| `unwrap_or(r, fallback) -> T` | the value, or `fallback` for `err`. Not for `!` |
+| `try_read_file(path) -> !string` | whole file, or an error such as `cannot open "x": No such file or directory` |
+| `try_write_file(path, content) -> !` | creates or replaces a file, or an error with the reason |
+| `try_parse_int(s) -> !int` | like `parse_int`, with an error instead of stopping the program |
+| `try_parse_float(s) -> !float` | like `parse_float`, with an error instead of stopping the program |
+| `getenv(name) -> string` | value of an environment variable, `""` if unset |
+| `has_env(name) -> bool` | true if the environment variable is set (even to `""`) |
+| `time_ms() -> int` | wall clock time in milliseconds since the Unix epoch |
+| `clock_ms() -> int` | monotonic milliseconds, for measuring durations and timeouts |
+| `sleep_ms(ms)` | pause; returns early once a trapped shutdown signal arrives |
+| `pid() -> int` | the process id |
+| `trap_shutdown()` | catch `SIGTERM` and `SIGINT` instead of dying (see below) |
+| `shutdown_requested() -> bool` | true once a trapped signal has arrived |
+| `tcp_listen_shared(host, port) -> int` | like `tcp_listen` with `SO_REUSEPORT`: several processes can listen on one port and the kernel spreads connections across them |
+| `tcp_poll(fds: [int], timeout_ms: int) -> [int]` | wait until sockets are readable. Returns the ready ones (in input order), or `[]` after the timeout or when a signal arrives. `-1` waits forever. A listening socket is ready when a client is waiting; a connection is ready when `tcp_read` will not block, including at end of stream |
+| `tcp_set_timeout(fd, ms) -> bool` | read and write timeout for a socket; `0` clears it. A timed out `tcp_read` returns `""` and `tcp_write` returns `-1` |
+| `tcp_peer(fd) -> string` | remote address as `1.2.3.4:5678` or `[::1]:5678`, `""` on failure |
 
 `push` and `pop` change their first argument, so they may only be used as a
 statement or as the entire value of a `let`, `var` or assignment. Their first
 argument must be a place rooted in a `var`.
+
+### Serving many clients
+
+There are no threads. A server handles many connections at once from one
+thread with `tcp_poll`, the same readiness model as `poll(2)` based servers:
+
+```
+trap_shutdown();
+var conns: [int] = [];
+while !shutdown_requested() {
+    var watch = [server];
+    for c in conns { push(watch, c); }
+    for fd in tcp_poll(watch, 1000) {
+        if fd == server {
+            push(conns, tcp_accept(server));   // check for -1 in real code
+        } else {
+            let data = tcp_read(fd, 4096);     // does not block: fd is ready
+            // ... "" means the client is gone: close it and drop it ...
+        }
+    }
+}
+```
+
+`examples/http/service.ks` is a complete HTTP service in this style with
+timeouts, logging and graceful shutdown. A connection that is ready to read
+never blocks `tcp_read`, but `tcp_write` can block on a client that stops
+reading; give each connection a `tcp_set_timeout`. To use more than one CPU
+core, run several processes that each call `tcp_listen_shared` on the same
+port.
+
+### Signals
+
+By default `SIGTERM` and `SIGINT` end the program immediately, like any C
+program. After `trap_shutdown()` they set a flag instead: `shutdown_requested()`
+becomes true, and a blocking `tcp_accept`, `tcp_read`, `tcp_poll` or
+`sleep_ms` returns early (`-1`, `""`, `[]`) so the program can finish its
+loop, close its sockets and exit. This is what process managers such as
+systemd and Docker send when they stop a service, and a program running as
+PID 1 in a container is not killed by `SIGTERM` at all unless it handles it.
+`SIGPIPE` is always ignored, so writing to a closed socket returns `-1`.
 
 Reading input:
 
@@ -315,9 +426,11 @@ Runtime errors print `kestrel: runtime error: <reason>` to standard error,
 flush standard output, and exit immediately with status 101. They cover
 integer overflow, division by zero, index and range errors, `pop` on an empty
 array, invalid `parse_int`/`parse_float` input, invalid conversions,
-unreadable files in `read_file`, failed `assert`s, out of memory, and stack
-overflow. Socket functions do not raise those errors: they return `-1` or `""`
-so a server loop can keep running when a client disconnects.
+unreadable files in `read_file`, `unwrap` of an error, failed `assert`s, out
+of memory, and stack overflow. Socket functions do not raise those errors:
+they return `-1` or `""` so a server loop can keep running when a client
+disconnects. Errors a program should recover from are results (`!T`); runtime
+errors are for bugs.
 
 Every function checks the remaining stack on entry. Recursion that would
 overflow the stack is reported as `stack overflow (recursion too deep)`. The
@@ -379,16 +492,32 @@ modules, generates one C11 translation unit, and runs a C compiler to produce
 a native executable. The C compiler is chosen from `--cc`, then the `CC`
 environment variable, then the first of `cc`, `gcc`, `clang` on `PATH`. The
 generated code needs GCC or Clang builtins (`__builtin_*_overflow`,
-`__builtin_frame_address`). `--sanitize` builds with AddressSanitizer and
-UndefinedBehaviorSanitizer for debugging. Linux and macOS are tested in CI;
-Windows is not.
+`__builtin_frame_address`). Linux and macOS are tested in CI; Windows is not.
+
+Build modes:
+
+- default: `-O2`.
+- `--release`: `-O2`, `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, and
+  on Linux a position independent executable with full RELRO
+  (`-z relro -z now`), stripped. Use it for anything you deploy.
+- `--static`: link statically. Fully static binaries work best with musl
+  (Alpine's gcc); with glibc, `getaddrinfo` (used to resolve host names in
+  `tcp_listen` and `tcp_connect`) still loads shared libraries at run time.
+- `--sanitize`: AddressSanitizer and UndefinedBehaviorSanitizer for debugging.
+  It cannot be combined with `--release` or `--static`.
+- `--cflags "..."` and `--ldflags "..."` pass extra flags to the C compiler,
+  before and after the source file. They are split on spaces.
+
+The C compiler runs in a temporary directory on a file named `program.c`, so
+the same source, compiler and flags produce the same binary byte for byte.
 
 ## Not supported
 
 Generics, closures and first-class functions, interfaces, enums,
-tuples, optional or error types, exceptions, compound
-assignment (`+=`), global variables and constants, string indexing by
-character, Unicode-aware string operations, deep equality on arrays and
-structs, concurrency, TLS, directory operations, environment variables, Go
-package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
+tuples, optional types, exceptions, typed errors (errors are messages),
+compound assignment (`+=`), global variables and constants, string indexing
+by character, Unicode-aware string operations, deep equality on arrays and
+structs, threads, async I/O beyond `tcp_poll`, TLS (put a reverse proxy such
+as Caddy or nginx in front), UDP, an HTTP library, directory operations,
+setting environment variables, Go package interop, and arbitrary C FFI. `fmt` has no format specs inside `{}` (no
 `{:.2}` and no `{0}`).

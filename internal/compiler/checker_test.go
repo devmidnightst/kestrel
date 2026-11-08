@@ -101,7 +101,7 @@ func TestTypeErrors(t *testing.T) {
 		{"import c \"stdlib.h\" { fn (self: int) abs(n: int) -> int; }\nfn main() {}", "c functions cannot be methods"},
 		{"fn other() {}", "entry file has no function main"},
 		{"fn main(a: int) {}", "main must not take parameters"},
-		{"fn main() -> string { return \"\"; }", "main must return nothing or int, not string"},
+		{"fn main() -> string { return \"\"; }", "main must return nothing, int or !, not string"},
 		{"fn main() { m.f(); }", "c.ks:1:13: error: undefined: m"},
 		{"import c \"stdlib.h\" { fn getenv(name: string) -> int; }\nfn main() {}", "c functions may only use int, bool and float parameters, not string"},
 		{"import c \"../etc/x.h\" { fn f() -> int; }\nfn main() {}", "invalid c header name \"../etc/x.h\""},

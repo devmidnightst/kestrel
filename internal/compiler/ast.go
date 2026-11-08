@@ -43,10 +43,18 @@ type TypeExpr struct {
 	Module string
 	Elem   *TypeExpr
 	Key    *TypeExpr
+	// Result marks a result type !T. Elem is the payload, or nil for a bare
+	// ! that carries no value.
+	Result bool
 }
 
 func (t *TypeExpr) String() string {
 	switch {
+	case t.Result:
+		if t.Elem == nil {
+			return "!"
+		}
+		return "!" + t.Elem.String()
 	case t.Key != nil:
 		return "{" + t.Key.String() + ": " + t.Elem.String() + "}"
 	case t.Elem != nil:
@@ -153,6 +161,8 @@ type ReturnStmt struct {
 type PrintStmt struct {
 	Pos  Pos
 	Args []Expr
+	// Stderr is true for eprint, which writes to standard error.
+	Stderr bool
 }
 
 type ExprStmt struct {
@@ -244,6 +254,13 @@ type MapEntry struct {
 	Value Expr
 }
 
+// TryExpr is try X: the payload of the result X, or an early return of
+// its error from the enclosing function.
+type TryExpr struct {
+	Pos Pos
+	X   Expr
+}
+
 type StructLit struct {
 	Pos    Pos
 	Module string
@@ -282,6 +299,7 @@ func (e *IndexExpr) P() Pos    { return e.X.P() }
 func (e *ArrayLit) P() Pos     { return e.Pos }
 func (e *MapLit) P() Pos       { return e.Pos }
 func (e *StructLit) P() Pos    { return e.Pos }
+func (e *TryExpr) P() Pos      { return e.Pos }
 
 func (*LetStmt) stmtNode()      {}
 func (*AssignStmt) stmtNode()   {}
@@ -308,3 +326,4 @@ func (*IndexExpr) exprNode()    {}
 func (*ArrayLit) exprNode()     {}
 func (*MapLit) exprNode()       {}
 func (*StructLit) exprNode()    {}
+func (*TryExpr) exprNode()      {}
