@@ -42,7 +42,7 @@ func CheckSource(file string, src []byte) (*Program, error) {
 	if len(f.Imports) > 0 {
 		return nil, ErrorList{errorf(f.Imports[0].Pos, "module imports require a file on disk; use Load")}
 	}
-	m := &Module{Path: file, Display: file, File: f, Imports: map[string]*Module{}}
+	m := &Module{Path: file, Display: file, Rel: file, File: f, Imports: map[string]*Module{}}
 	for _, ci := range f.CImports {
 		if err := validateHeader(ci.Header); err != nil {
 			return nil, ErrorList{errorf(ci.HdrPos, "%v", err)}

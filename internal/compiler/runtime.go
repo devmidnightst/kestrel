@@ -59,10 +59,12 @@ static uintptr_t ks_stack_limit;
 static ks_obj *ks_pending;
 static bool ks_draining;
 static volatile sig_atomic_t ks_shutdown_flag;
+static const char *ks_loc;
 
 __attribute__((noreturn, unused)) static void ks_panic(const char *msg) {
 	fflush(stdout);
 	fprintf(stderr, "kestrel: runtime error: %s\n", msg);
+	if (ks_loc != NULL) fprintf(stderr, "    at %s\n", ks_loc);
 	fflush(stderr);
 	_Exit(101);
 }

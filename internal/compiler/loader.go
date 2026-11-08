@@ -74,7 +74,11 @@ func (l *loader) load(real string, chain []string) (*Module, error) {
 		return nil, err
 	}
 	l.visiting[real] = true
-	m := &Module{Path: real, Display: disp, File: f, Imports: map[string]*Module{}}
+	rel := filepath.Base(real)
+	if r, err := filepath.Rel(l.root, real); err == nil {
+		rel = filepath.ToSlash(r)
+	}
+	m := &Module{Path: real, Display: disp, Rel: rel, File: f, Imports: map[string]*Module{}}
 	for _, ci := range f.CImports {
 		if err := validateHeader(ci.Header); err != nil {
 			l.errs = append(l.errs, errorf(ci.HdrPos, "%v", err))

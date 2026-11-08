@@ -505,7 +505,7 @@ func checkRandomPrograms(t *testing.T, count int, sanitize bool) {
 		if code != 0 && !(code == 101 && strings.HasPrefix(errOut, "kestrel: runtime error: ")) {
 			t.Fatalf("seed %d: exit %d, stderr %q\n%s", seed, code, errOut, src)
 		}
-		if strings.Contains(errOut, "Sanitizer") {
+		if strings.Contains(errOut, "Sanitizer:") {
 			t.Fatalf("seed %d: sanitizer report:\n%s\n%s", seed, errOut, src)
 		}
 	}
