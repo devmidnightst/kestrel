@@ -6,12 +6,14 @@ installed c compiler (cc, gcc or clang) to produce a native executable.
 
 kestrel is young. the compiler is tested hard (unit tests, fuzzing, and
 thousands of randomly generated programs compiled and run under address and
-undefined behavior sanitizers in ci), but nobody has run it in production yet,
-and it makes no performance promises. it has what a small network service
-needs (recoverable errors, a poll-based multi-client tcp loop, graceful
-shutdown, env config, hardened static builds, a docker image), and
-[docs/deploy.md](docs/deploy.md) shows how to ship one. read the "what does
-not exist" section before betting anything on it.
+undefined behavior sanitizers in ci, plus a fuzzer on the runtime's parsers
+and a load test of the http service), but nobody has run it in production
+yet. it has what a network service needs: recoverable errors, http/1.1 and
+json, crypto for tokens and passwords, a non-blocking event loop, worker
+processes that restart after a crash, graceful shutdown, runtime errors with
+file and line, a test runner, hardened static builds and a docker image.
+[docs/deploy.md](docs/deploy.md) shows how to ship one, and "what does not
+exist" below says where it stops.
 
 ## requirements
 
@@ -30,7 +32,7 @@ latest one, checks its checksum, and puts it in `/usr/local/bin`:
 curl -fsSL https://raw.githubusercontent.com/devmidnightst/kestrel/main/install.sh | sh
 ```
 
-(`KESTREL_VERSION=v0.3.0` pins a release, `KESTREL_INSTALL_DIR=~/bin` changes
+(`KESTREL_VERSION=v0.4.0` pins a release, `KESTREL_INSTALL_DIR=~/bin` changes
 where it goes.) compiling a kestrel program still needs `cc`, `gcc`, or
 `clang` on that machine. the binaries are the compiler, not a replacement for
 a c toolchain.
@@ -135,12 +137,30 @@ contents: arrays and structs are values, not shared references.
   `try_parse_float` that return results), the environment (`getenv`,
   `has_env`, `pid`), time (`time_ms`, `clock_ms`, `sleep_ms`), and TCP
   (`tcp_listen`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_close`,
-  `tcp_peer`, `tcp_set_timeout`). failed sockets return `-1` or `""` instead
-  of stopping the process
-- serving many clients at once from one thread: `tcp_poll(fds, timeout_ms)`
-  returns the sockets that are ready, so a slow client never blocks the
-  others. `tcp_listen_shared` lets several processes share a port to use
-  more cores. see [examples/http/service.ks](examples/http/service.ks)
+  `tcp_peer`, `tcp_set_timeout`, `tcp_connect_timeout`). failed sockets
+  return `-1` or `""` instead of stopping the process
+- many clients per process without blocking: `tcp_wait(reads, writes,
+  timeout_ms)` reports which sockets can be read or written, `tcp_send`
+  writes what fits and never blocks, and `tcp_try_accept` never hangs
+- worker processes: `fork_workers(cpu_count())` runs one worker per core on a
+  shared socket and restarts any that crash, so a bug hit by one request
+  takes down one worker, not the service
+- a standard library inside the compiler: `import "std:http";` frames and
+  parses http/1.1 requests (keep-alive, pipelining, strict header parsing,
+  size limits) and builds responses that cannot be split by echoed input.
+  see [examples/http/service.ks](examples/http/service.ks)
+- json by path: `json_int(doc, "user.age")`, `json_string(doc,
+  "items.0.name")`, `json_len`, `json_keys`, `json_raw`, `json_valid`, and
+  `json_quote` for writing it
+- crypto and encoding: `random_bytes` and `random_int` from the os csprng,
+  `sha256`, `hmac_sha256`, `pbkdf2_sha256` for passwords,
+  `constant_time_eq`, `hex`, `base64`, `base64url`, `url_encode` and their
+  decoders, and `format_time` for rfc 3339 timestamps
+- runtime errors say where they happened: `    at app.ks:12 in main`
+- `kestrel test` runs every `fn test_name()` in `*_test.ks` files, each in
+  its own process, with timeouts and optional sanitizers
+- maps keep insertion order, and their hashes are keyed randomly per process
+  so clients cannot force collisions
 - graceful shutdown: after `trap_shutdown()`, `SIGTERM` and `SIGINT` set
   `shutdown_requested()` and wake blocking socket calls instead of killing
   the process, so it can close its sockets and exit 0 (and work as pid 1 in
@@ -161,15 +181,18 @@ contents: arrays and structs are values, not shared references.
 ## what does not exist
 
 no generics, closures, enums, tuples, optional types, globals, threads,
-TLS, or unicode-aware string functions (strings are bytes). arrays and
-structs cannot be compared with `==`. errors are messages, not types: you
-can propagate and inspect them but not match on kinds of error. there is no
-HTTP library (the service example parses requests by hand) and no TLS, so
-put caddy or nginx in front for https. concurrency is one thread plus
-`tcp_poll`, or several processes; `tcp_write` blocks until the data is sent
-or its timeout passes. the c import is not a general ffi: no strings,
-pointers, structs, callbacks, or extra libraries. there is no go package
-interop.
+or unicode-aware string functions (strings are bytes). arrays and structs
+cannot be compared with `==`. errors are messages, not types: you can
+propagate and inspect them but not match on kinds of error. no tls (put
+caddy or nginx in front), no http/2, no chunked request bodies, no http
+client, no database drivers, no udp, no subprocesses, no directory listing.
+json is read by path; there is no json tree value. name resolution
+(`getaddrinfo`) blocks, so resolve hosts at startup in a busy event loop.
+no formatter, language server or debugger integration beyond the c
+compiler's. the c import is not a general ffi: no strings, pointers,
+structs, callbacks, or extra libraries. there is no go package interop.
+the crypto is implemented in the runtime and tested against reference
+vectors, but has had no outside audit.
 
 copy-on-write has a cost model worth knowing: changing a value that is still
 shared copies it first, so a function that takes an array, changes it and
@@ -194,7 +217,8 @@ kestrel run examples/structs.ks
 kestrel run examples/modules/main.ks
 kestrel run examples/cheader.ks
 printf 'the cat\nthe dog\n' | kestrel run examples/wordfreq.ks
-PORT=8080 kestrel run examples/http/service.ks   # then curl localhost:8080
+PORT=8080 WORKERS=4 kestrel run --release examples/http/service.ks   # then curl localhost:8080
+kestrel test examples/testing
 ```
 
 ## deploying

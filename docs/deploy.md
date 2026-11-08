@@ -54,21 +54,31 @@ The checklist the reference service follows:
   program, and propagate with `try`.
 - **Logs on standard error.** `eprint(...)` is line buffered, so each line
   is written whole. systemd's journal and `docker logs` collect it.
-- **Serve clients concurrently.** Use `tcp_poll` to wait on the listening
-  socket and every open connection at once. Never call `tcp_read` on a
-  socket `tcp_poll` did not report ready.
-- **Bound everything.** `tcp_set_timeout` on each connection so a client
-  that stops reading cannot block `tcp_write` forever; cap request sizes;
-  close connections that never finish their request.
+- **Never block the event loop.** Wait on the listener and every
+  connection with `tcp_wait`, accept with `tcp_try_accept`, read only
+  sockets it reported readable, and write with `tcp_send`, keeping what did
+  not fit until the socket is writable again. Use `std:http` to frame and
+  parse requests instead of hand-rolled parsing.
+- **Bound everything.** Cap request heads and bodies (`http.frame` does
+  both), close idle connections, and set `tcp_set_timeout` as a backstop.
+- **Contain crashes.** Run `fork_workers(n)`: a runtime error kills one
+  worker, its connections drop, and the supervisor starts a replacement
+  while the others keep serving. The error and its `file:line` go to
+  standard error.
+- **Handle secrets properly.** Hash passwords with `pbkdf2_sha256` and a
+  `random_bytes(16)` salt, make tokens from `random_bytes`, sign with
+  `hmac_sha256`, and compare secrets with `constant_time_eq`.
 - **Graceful shutdown.** Call `trap_shutdown()` at start, loop on
-  `!shutdown_requested()`, and give `tcp_poll` a timeout (the reference uses
+  `!shutdown_requested()`, and give `tcp_wait` a timeout (the reference uses
   1000 ms). On `SIGTERM` the blocking call returns early, the loop ends, and
   the program closes its sockets and returns. This also matters in
   containers: a process running as PID 1 ignores `SIGTERM` unless it handles
   it, so without `trap_shutdown` Docker waits and then kills it.
-- **More than one core.** Run several processes and have each call
-  `tcp_listen_shared(host, port)`; the kernel spreads connections across
-  them.
+- **More than one core.** `fork_workers(cpu_count())` after `tcp_listen`
+  (the reference reads `WORKERS`). Separate processes that each call
+  `tcp_listen_shared` also work, for example one per systemd unit.
+- **Test it.** Put `fn test_...()` functions in `*_test.ks` files and run
+  `kestrel test` (add `--sanitize` in CI to catch memory errors and leaks).
 
 ## 3. Docker
 
@@ -119,7 +129,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/hello
-Environment=HOST=127.0.0.1 PORT=8080
+Environment=HOST=127.0.0.1 PORT=8080 WORKERS=4
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM
@@ -146,13 +156,13 @@ sudo systemctl enable --now hello
 journalctl -u hello -f
 ```
 
-To use several cores, make it a template unit (`hello@.service`), have the
-program listen with `tcp_listen_shared`, and start `hello@1`, `hello@2`, and
-so on. Each process has its own memory, so there is nothing to share or lock.
+The reference service uses all cores with one unit: set
+`Environment=WORKERS=4` and systemd tracks the supervisor and its workers as
+one service. `KillMode=control-group` (the default) also signals the workers
+directly on stop, which is harmless: each one shuts down gracefully.
 
-pm2 also works (`pm2 start /usr/local/bin/hello --name hello`); pm2's
-cluster mode is for Node.js only, so for several processes start several
-named instances on the same port with `tcp_listen_shared`.
+pm2 also works (`pm2 start /usr/local/bin/hello --name hello`). Leave
+pm2's own cluster mode off (it is for Node.js) and use `WORKERS`.
 
 ## 5. TLS and the edge
 

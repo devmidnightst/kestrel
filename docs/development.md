@@ -30,6 +30,15 @@ example `CC=clang go test ./...`.
   socket timeouts and `SO_REUSEPORT`, and `examples/http/service.ks` serving
   concurrent clients while one connection holds a half-sent request, then
   shutting down on SIGTERM (release and sanitized builds).
+- `prod_test.go`: runtime error locations, non-blocking sockets,
+  `fork_workers` restarts, ordered maps against a model (20000 random
+  operations), crypto against Python reference vectors, JSON, `std:` imports
+  and `std:http`, and `TestRuntimeParserFuzz`, which builds
+  `testdata/fuzz_runtime.c` against the generated runtime with ASan and UBSan
+  and feeds mutated inputs to the JSON, URL, base64 and hex decoders
+  (`KESTREL_FUZZ_ITERS` sets the count).
+- `service_test.go` also has `TestServiceLoad` (2000 keep-alive requests
+  over 50 connections to 4 workers) and `TestWorkerCrashIsolation`.
 - `release_test.go`: `--release` and `--static` flags, hardening checks with
   `readelf`, and byte-for-byte reproducible builds.
 - `fuzz_test.go`: fuzz targets.
@@ -89,7 +98,7 @@ that must exit 0.
 ## Release builds
 
 ```sh
-go build -trimpath -ldflags "-s -w -X github.com/devmidnightst/kestrel/internal/cli.Version=0.3.0" -o kestrel ./cmd/kestrel
+go build -trimpath -ldflags "-s -w -X github.com/devmidnightst/kestrel/internal/cli.Version=0.4.0" -o kestrel ./cmd/kestrel
 ```
 
 Without the `-X` flag, `kestrel version` reports the development version.
